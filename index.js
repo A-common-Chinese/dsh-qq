@@ -19,6 +19,7 @@ import { randomUUID } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { createPrivacyFilter } from './privacy.js';
 
 /**
  * chatKey → sessionId 的持久映射。有了它，DSH 重启/插件重载后同一个 QQ 会话还能
@@ -61,7 +62,28 @@ const DEFAULTS = {
   enableSendTool: true,
   sendToolName: 'qq_send',
   enableSendFileTool: true,
-  sendFileToolName: 'qq_send_file'
+  sendFileToolName: 'qq_send_file',
+  /**
+   * 隐私过滤（细节在 privacy.js）：
+   *   · allowedChats 里的会话（默认只有你的私聊）—— 原样放行，一个字都不动；
+   *   · 其他任何会话（所有群 + 其他私聊）—— 命中即处理：
+   *       密钥/口令/连接串等高置信秘密 → 整条拒发；
+   *       邮箱/手机/身份证/卡号/用户名·主机名/用户目录路径/IP → 就地打码后照发；
+   *       打码后只剩占位符 → 拒发。
+   * 覆盖三处出口：桥回传给 QQ 的回复、qq_send、qq_send_file。
+   */
+  privacy: {
+    enabled: true,
+    allowedChats: ['private:85946573'],
+    mode: 'redact',
+    blockOnSecrets: true,
+    blockedReply: '（这条回复含不宜发往该会话的隐私信息，已被隐私过滤拦截）',
+    noticeSuffix: false,
+    logMatches: true,
+    scanFileContents: true,
+    maxScanBytes: 2097152,
+    extraPatterns: []
+  }
 };
 
 let Schema = null;
@@ -91,7 +113,21 @@ export const Config = Schema
       enableSendTool: Schema.boolean().default(true),
       sendToolName: Schema.string().default(DEFAULTS.sendToolName),
       enableSendFileTool: Schema.boolean().default(true),
-      sendFileToolName: Schema.string().default(DEFAULTS.sendFileToolName)
+      sendFileToolName: Schema.string().default(DEFAULTS.sendFileToolName),
+      // 注意：profile 里只有 @deepseek-ai/schemastery，裸名 import 会失败 → Config 实际为
+      // undefined，配置原样传入。这里仍然声明一遍，是为了将来 schema 真能解析时不被剥掉字段。
+      privacy: Schema.object({
+        enabled: Schema.boolean().default(true),
+        allowedChats: Schema.array(Schema.string()).default(['private:85946573']),
+        mode: Schema.string().default('redact'),
+        blockOnSecrets: Schema.boolean().default(true),
+        blockedReply: Schema.string().default(DEFAULTS.privacy.blockedReply),
+        noticeSuffix: Schema.boolean().default(false),
+        logMatches: Schema.boolean().default(true),
+        scanFileContents: Schema.boolean().default(true),
+        maxScanBytes: Schema.number().default(DEFAULTS.privacy.maxScanBytes),
+        extraPatterns: Schema.array(Schema.any()).default([])
+      })
     })
   : undefined;
 
@@ -176,6 +212,13 @@ function withTimeout(promise, ms, onTimeout) {
 export function apply(ctx, config) {
   const cfg = { ...DEFAULTS, ...(config && typeof config === 'object' ? config : {}) };
   if (cfg.enabled === false) return;
+
+  // privacy 是嵌套对象：浅合并会把默认值整体顶掉，所以单独再合一层。
+  const privacyCfg = {
+    ...DEFAULTS.privacy,
+    ...((config && typeof config === 'object' && config.privacy) || {})
+  };
+  const privacy = createPrivacyFilter(privacyCfg);
 
   /** chatKey -> { handle, agent, busy, lastUsed, turns, sessionId } */
   const chats = new Map();
@@ -361,6 +404,28 @@ export function apply(ctx, config) {
         try {
           const result = await ask(chatKey, text);
           log(`← ${chatKey} 一轮完成（${result.elapsedMs}ms，第 ${result.turns} 轮）`);
+          // ── 隐私闸门：这条回程是主要泄漏面（别人问，DSH 答，答案落进那个会话）──
+          const gate = privacy.filterText(chatKey, result.reply);
+          if (!gate.bypass && !gate.ok) {
+            const reason = `隐私过滤拦截（${gate.blockedBy}）`;
+            log(`← ${chatKey} ${reason}，已替换为通用提示`);
+            return sendJson(res, 200, {
+              ok: true,
+              ...result,
+              reply: String(privacyCfg.blockedReply || DEFAULTS.privacy.blockedReply),
+              privacy: { blocked: true, reason, rules: gate.hits.map((h) => h.id) }
+            });
+          }
+          if (!gate.bypass && gate.hits.length) {
+            const summary = gate.hits.map((h) => `${h.id}×${h.count}`).join('、');
+            log(`← ${chatKey} 隐私打码：${summary}`);
+            return sendJson(res, 200, {
+              ok: true,
+              ...result,
+              reply: gate.text,
+              privacy: { blocked: false, redacted: gate.hits.map((h) => ({ id: h.id, count: h.count })) }
+            });
+          }
           return sendJson(res, 200, { ok: true, ...result });
         } catch (error) {
           log(`← ${chatKey} 出错：${error?.message ?? error}`);
@@ -374,6 +439,7 @@ export function apply(ctx, config) {
         sendJson(res, 200, {
           ok: true,
           cwd: cfg.cwd || process.cwd(),
+          privacy: privacy.describe(),
           chats: [...chats.entries()].map(([chatKey, e]) => ({
             chatKey,
             sessionId: e.sessionId,
@@ -416,17 +482,37 @@ export function apply(ctx, config) {
             properties: {
               ok: { type: 'boolean' },
               chat: { type: 'string' },
-              messageId: { type: 'string' }
+              messageId: { type: 'string' },
+              note: { type: 'string' }
             }
           },
           render: (_args, value) => [
-            { type: 'text', text: value?.ok ? `已发送到 ${value.chat}` : `发送失败：${value?.chat ?? ''}` }
+            {
+              type: 'text',
+              text: value?.ok
+                ? `已发送到 ${value.chat}${value?.note ? `（${value.note}）` : ''}`
+                : `发送失败：${value?.chat ?? ''}`
+            }
           ]
         },
         isConcurrencySafe: () => true,
         async execute(args) {
-          const result = await pushToQQ(args.chat, args.text);
-          return { ok: true, chat: String(args.chat), messageId: String(result?.messageId ?? '') };
+          const gate = privacy.filterText(args.chat, args.text);
+          if (!gate.bypass && !gate.ok) {
+            throw new Error(
+              `隐私过滤：这条消息含不宜发往 ${args.chat} 的内容（命中 ${gate.blockedBy}），已拦截。` +
+              `请改写后重发；白名单会话为 ${privacy.allowedChats.join('、')}。`
+            );
+          }
+          const result = await pushToQQ(args.chat, gate.text);
+          return {
+            ok: true,
+            chat: String(args.chat),
+            messageId: String(result?.messageId ?? ''),
+            ...(gate.hits.length
+              ? { note: `已打码 ${gate.hits.map((h) => `${h.id}×${h.count}`).join('、')}` }
+              : {})
+          };
         }
       })
     );
@@ -462,21 +548,39 @@ export function apply(ctx, config) {
               ok: { type: 'boolean' },
               chat: { type: 'string' },
               name: { type: 'string' },
-              fileId: { type: 'string' }
+              fileId: { type: 'string' },
+              note: { type: 'string' }
             }
           },
           render: (_args, value) => [
-            { type: 'text', text: value?.ok ? `已发送文件 ${value.name} 到 ${value.chat}` : `发送失败：${value?.chat ?? ''}` }
+            {
+              type: 'text',
+              text: value?.ok
+                ? `已发送文件 ${value.name} 到 ${value.chat}${value?.note ? `（${value.note}）` : ''}`
+                : `发送失败：${value?.chat ?? ''}`
+            }
           ]
         },
         isConcurrencySafe: () => true,
         async execute(args) {
-          const result = await sendFileToQQ(args.chat, args.path, args.name);
+          // 隐私闸门：文件名按文本规则判，文本类文件的内容只做 block 级扫描（命中即拒发）
+          const gate = privacy.filterFile(args.chat, args.path);
+          if (!gate.bypass && !gate.ok) {
+            const why = String(gate.blockedBy || '').startsWith('file-content:')
+              ? '文件内容命中密钥/口令类规则'
+              : `文件名/路径命中 ${gate.blockedBy}`;
+            throw new Error(`隐私过滤：${why}，已拦截，未发送到 ${args.chat}。`);
+          }
+          const safeName = gate.bypass ? args.name : (gate.safeName || args.name);
+          const result = await sendFileToQQ(args.chat, args.path, safeName);
           return {
             ok: true,
             chat: String(args.chat),
-            name: String(result?.name ?? args.name ?? ''),
-            fileId: String(result?.fileId ?? '')
+            name: String(result?.name ?? safeName ?? ''),
+            fileId: String(result?.fileId ?? ''),
+            ...(gate.hits.length
+              ? { note: `文件名/内容已处理 ${gate.hits.map((h) => `${h.id}×${h.count}`).join('、')}` }
+              : {})
           };
         }
       })
@@ -508,4 +612,12 @@ export function apply(ctx, config) {
   });
 
   log(`已加载（route=${cfg.routePath}，cwd=${cfg.cwd || '(继承)'}，qq=${cfg.qqBaseUrl}）`);
+  if (privacy.enabled) {
+    log(
+      `隐私过滤已启用：白名单=[${privacy.allowedChats.join('、')}]，mode=${privacy.mode}` +
+      `，密钥类=拒发，其他=${{ redact: '打码', block: '拒发' }[privacy.mode]}`
+    );
+  } else {
+    log('⚠️ 隐私过滤已关闭（privacy.enabled=false）：任何会话都会收到原样内容');
+  }
 }

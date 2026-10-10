@@ -26,6 +26,39 @@ QQ ↔ DeepSeek Harness 桥的 **DSH 侧**插件：让 QQ 里的对话落到一�
 | `idleDisposeMs` | 1800000 | 常驻会话空闲多久被回收（dispose） |
 | `qqBaseUrl` / `qqToken` | `http://127.0.0.1:3310` / `''` | DSH → QQ 推送的目标（QQ Agent 控制台）。qqToken 对应 QQ 侧的 `server.token` |
 | `enableSendTool` / `sendToolName` | true / `qq_send` | 是否注册推送工具 |
+| `privacy` | 见下 | 出站隐私过滤（白名单外会话不许收到隐私信息） |
+
+## 隐私过滤（`privacy`）
+
+**目的**：DSH 的内容送往**非白名单会话**时不得携带隐私信息；白名单会话（默认 `private:85946573`）原样放行、一个字都不动。
+实现见 [`privacy.js`](privacy.js)，单测 `node test/privacy.test.mjs`（26 项）。
+
+覆盖三处出口：**桥回传给 QQ 的回复**（主要泄漏面）、工具 `qq_send`、工具 `qq_send_file`（文件名 + 文本类文件内容）。
+
+| 级别 | 命中后 | 规则（内置） |
+|---|---|---|
+| **拒发**（fail-closed） | 整条不发；`qq_send` 抛错并告诉模型改写 | 私钥块、`sk-…`/`sk-ant-…`/`ghp_…`/`AIza…`/`AKIA…`/`xox…`/JWT、`token/password/密码/口令/密钥: xxx` 赋值、带凭据的连接串（mysql/redis/mongo…） |
+| **打码** | 就地替换成 `[已隐去:类型]` 后照发 | 邮箱、手机号、身份证、银行卡号、`C:\Users\<用户名>\…`、UNC 主机、内网 IP、**本机用户名/主机名**字面量 |
+| **拒发** | 打码后只剩下占位符（整条消息就是一个手机号之类）→ 不发送 | — |
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `enabled` | true | 关掉 = 所有会话都原样收到（不建议） |
+| `allowedChats` | `['private:85946573']` | 可收到原样内容的会话；裸 QQ 号按 `private:<号>` 算。**组永远不在白名单里**，除非你显式写 `group:<群号>` |
+| `mode` | `redact` | `redact` = 打码后照发；`block` = 任何命中都整条拒发 |
+| `blockOnSecrets` | true | 密钥/口令类永不外发（即使 `mode=redact`） |
+| `blockedReply` | 一句中文提示 | 回程被拒发时，替换成这句话发给对方 |
+| `noticeSuffix` | false | 打码时是否在末尾附一句"已隐去 N 处" |
+| `logMatches` | true | 命中时在日志留痕：**只记规则名和次数，不记内容** |
+| `scanFileContents` | true | 发文件前扫文本类扩展名（txt/md/json/env/js/ps1…，≤ `maxScanBytes`）的**内容**，命中拒发级规则就不发；读不了或不认识的扩展名只判文件名 |
+| `maxScanBytes` | 2097152 | 内容扫描上限 |
+| `extraPatterns` | `[]` | 自定义规则 `[{ id, regex, flags?, action: 'redact'\|'block', replace? }]`，用于封自己项目里的代号/域名等 |
+
+> 说明：插件层的过滤会在**模型面前**直接失败（`qq_send` 抛错、回程被替换），便于模型自我改写；
+> QQ Agent（fork）侧 [src/privacy.js](https://github.com/A-common-Chinese/QQ-agent) 有一份**同源同规则**的实现，
+> 因为 fork 才是所有 DSH 内容落到 QQ 的咽喉（`/api/inbound` + 桥回传回复都经它的 sender 出去），
+> 而且改 fork 只要重启 QQ Agent、不必重启 DSH。两层互为兜底。
+
 
 ## 安装 / 生效
 
