@@ -78,6 +78,12 @@ const DEFAULTS = {
    */
   permissionPreset: '',
   /**
+   * 恢复老会话时预设挂不上怎么办：'warn' = 只告警（保持上下文，但没有 shell 工具）；
+   * 'recreate' = 弃用旧会话、新建一个（一定有工具，代价是丢这条 QQ 会话的上下文）。
+   * 改这个键是**配置热重载**，不用重启 DSH。
+   */
+  onPresetFailure: 'warn',
+  /**
    * 隐私过滤（细节在 privacy.js）：
    *   · allowedChats 里的会话（默认只有你的私聊）—— 原样放行，一个字都不动；
    *   · 其他任何会话（所有群 + 其他私聊）—— 命中即处理：
@@ -287,20 +293,40 @@ export function apply(ctx, config) {
     const wanted = String(cfg.agentPreset || '').trim();
     if (!wanted) return;
     const presets = typeof ctx.get === 'function' ? ctx.get('agentPresets') : null;
-    if (!presets || typeof presets.select !== 'function') {
+    if (!presets) {
+      entry.presetNote = 'agentPresets 服务不可用';
       log(`⚠️ 无法应用 agentPreset=${wanted}：本进程没有 agentPresets 服务`);
       return;
     }
-    try {
-      const before = typeof presets.composedPreset === 'function'
-        ? presets.composedPreset(entry.agent.ctx ?? ctx)
-        : undefined;
-      const applied = await presets.select(entry.agent, wanted);
-      entry.agentPreset = applied || wanted;
-      log(`agent 预设已应用（${why}）：${before ?? '(无)'} → ${entry.agentPreset}`);
-    } catch (error) {
-      log(`⚠️ 应用 agentPreset=${wanted} 失败：${error?.message ?? error}`);
+    const agentCtx = entry.agent.ctx ?? ctx;
+    // 三条路依次试，谁先成功算谁：
+    //   mount     = 把预设里的插件挂进这个 ctx（**工具面就是在这一步出现的**）
+    //   select    = 按 agent 记录所选预设（GUI 的模式 chip 读它）
+    //   recompose = 已经挂过预设时，按新 id 重新组合
+    // 实测：create 时用 meta.agentPreset 就够；resume 出来的老会话没有 meta，只能靠这里补挂。
+    const attempts = [
+      ['mount', () => presets.mount?.(agentCtx, wanted)],
+      ['select', () => presets.select?.(entry.agent, wanted)],
+      ['recompose', () => presets.recompose?.(agentCtx, wanted)]
+    ];
+    const errors = [];
+    for (const [name, run] of attempts) {
+      try {
+        const out = await run();
+        if (out === undefined && name !== 'select' && typeof presets[name] !== 'function') {
+          errors.push(`${name}: 无此方法`);
+          continue;
+        }
+        entry.agentPreset = wanted;
+        entry.presetNote = `${name} 成功（${why}）`;
+        log(`agent 预设已应用（${why}，走 ${name}）：${wanted}`);
+        return;
+      } catch (error) {
+        errors.push(`${name}: ${error?.message ?? error}`);
+      }
     }
+    entry.presetNote = '全部失败 —— ' + errors.join(' | ');
+    log(`⚠️ 应用 agentPreset=${wanted} 失败（${why}）：${entry.presetNote}`);
   }
 
   /**
@@ -323,10 +349,15 @@ export function apply(ctx, config) {
     }
     try {
       const current = typeof perms.current === 'function' ? perms.current(session) : undefined;
-      if (current === name) return;
+      if (current === name) {
+        entry.permissionNote = `${name}（已是）`;
+        return;
+      }
       perms.set(session, name);
+      entry.permissionNote = `${current ?? '(未知)'} → ${name}（${why}）`;
       log(`权限预设已切换（${why}）：${current ?? '(未知)'} → ${name}`);
     } catch (error) {
+      entry.permissionNote = `切换 ${name} 失败：${error?.message ?? error}`;
       log(`⚠️ 应用 permissionPreset=${name} 失败：${error?.message ?? error}`);
     }
   }
@@ -373,6 +404,18 @@ export function apply(ctx, config) {
         // 恢复出来的老会话可能是"没预设/旧预设"的：补挂一次，这样不用清会话映射
         await applyAgentPreset(entry, '恢复会话');
         applyPermissionPreset(entry, cfg.permissionPreset, '恢复会话');
+        // 兜底：预设挂不上 ⇒ 这个会话拿不到 shell 这类核心工具。是否"弃用旧会话、按新代码新建一个"
+        // 由配置决定：warn（默认，只告警）| recreate（新建，代价是丢这条会话的上下文）。
+        // 新建那条路用 meta.agentPreset，实测一定能带上工具。
+        if (String(entry.presetNote || '').startsWith('全部失败')
+          && String(cfg.onPresetFailure || 'warn') === 'recreate') {
+          log(`⚠️ 老会话挂不上预设（${entry.presetNote}），按 onPresetFailure=recreate 弃用并新建`);
+          try { await entry.handle.dispose(); } catch { /* 尽力释放 */ }
+          chats.delete(chatKey);
+          delete chatState[chatKey];
+          saveChatState(chatState);
+          return createChat(chatKey);
+        }
         return entry;
       } catch (error) {
         log(`恢复会话 ${saved} 失败（${error?.message ?? error}），改建新会话`);
@@ -409,7 +452,16 @@ export function apply(ctx, config) {
         const reason = lastTurnReason(session);
         throw new Error(`本轮没有产生 assistant 文本（model=${entry.model ?? '?'}，turn/end=${JSON.stringify(reason)}）`);
       }
-      return { reply, sessionId: entry.sessionId, elapsedMs: Date.now() - startedAt, turns: entry.turns };
+      return {
+        reply,
+        sessionId: entry.sessionId,
+        elapsedMs: Date.now() - startedAt,
+        turns: entry.turns,
+        // 诊断：宿主/插件的 console 输出不一定落盘，把关键状态挂到响应里才验得动
+        ...(entry.agentPreset ? { agentPreset: entry.agentPreset } : {}),
+        ...(entry.presetNote ? { presetNote: entry.presetNote } : {}),
+        ...(entry.permissionNote ? { permissionNote: entry.permissionNote } : {})
+      };
     } finally {
       entry.busy = false;
     }
@@ -520,19 +572,48 @@ export function apply(ctx, config) {
         }
       });
 
-      mount(String(cfg.statusPath), (req, res) => {
+      mount(String(cfg.statusPath), async (req, res) => {
         const url = new URL(req.url || '/', 'http://127.0.0.1');
         if (!authorized(req, url)) return sendJson(res, 401, { ok: false, error: 'bridgeToken 不匹配' });
+        // 预设诊断：本机到底有哪些预设可选、每个常驻会话实际挂上了什么
+        let availableAgentPresets = [];
+        let availablePermissionPresets = [];
+        let defaultPermissionPreset = null;
+        try {
+          const ap = typeof ctx.get === 'function' ? ctx.get('agentPresets') : null;
+          if (ap && typeof ap.list === 'function') {
+            availableAgentPresets = (await ap.list()).map((p) => p?.id ?? p).filter(Boolean);
+          }
+        } catch (error) { availableAgentPresets = ['(列不出来: ' + (error?.message ?? error) + ')']; }
+        try {
+          const pp = typeof ctx.get === 'function' ? ctx.get('permissionPresets') : null;
+          if (pp && typeof pp.catalog === 'function') {
+            const cat = pp.catalog();
+            availablePermissionPresets = [...new Set([...(cat?.options ?? []), ...(cat?.defaultOptions ?? [])]
+              .map((o) => o?.value).filter(Boolean))];
+            defaultPermissionPreset = cat?.defaultPreset ?? null;
+          }
+        } catch { /* 诊断失败不影响状态返回 */ }
         sendJson(res, 200, {
           ok: true,
           cwd: cfg.cwd || process.cwd(),
           privacy: privacy.describe(),
+          presets: {
+            agentPreset: cfg.agentPreset || '',
+            permissionPreset: cfg.permissionPreset || '',
+            availableAgentPresets,
+            availablePermissionPresets,
+            defaultPermissionPreset
+          },
           chats: [...chats.entries()].map(([chatKey, e]) => ({
             chatKey,
             sessionId: e.sessionId,
             busy: e.busy,
             turns: e.turns,
-            lastUsed: e.lastUsed
+            lastUsed: e.lastUsed,
+            agentPreset: e.agentPreset ?? null,
+            presetNote: e.presetNote ?? null,
+            permissionNote: e.permissionNote ?? null
           }))
         });
       });
