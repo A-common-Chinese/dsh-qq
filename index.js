@@ -218,7 +218,7 @@ export function apply(ctx, config) {
     ...DEFAULTS.privacy,
     ...((config && typeof config === 'object' && config.privacy) || {})
   };
-  const privacy = createPrivacyFilter(privacyCfg);
+  const privacy = createPrivacyFilter({ ...privacyCfg, logger: (msg) => log(`[privacy] ${msg}`) });
 
   /** chatKey -> { handle, agent, busy, lastUsed, turns, sessionId } */
   const chats = new Map();

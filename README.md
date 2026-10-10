@@ -46,7 +46,7 @@ QQ ↔ DeepSeek Harness 桥的 **DSH 侧**插件：让 QQ 里的对话落到一�
 | `enabled` | true | 关掉 = 所有会话都原样收到（不建议） |
 | `allowedChats` | `['private:85946573']` | 可收到原样内容的会话；裸 QQ 号按 `private:<号>` 算。**组永远不在白名单里**，除非你显式写 `group:<群号>` |
 | `mode` | `redact` | `redact` = 打码后照发；`block` = 任何命中都整条拒发 |
-| `blockOnSecrets` | true | 密钥/口令类永不外发（即使 `mode=redact`） |
+| `blockOnSecrets` | true | 密钥/口令类**整条拒发**；设为 `false` 时降级为**打码后照发**（`mode: 'block'` 时仍然拒发）。注意：键名含 `secret`，QQ Agent 控制台的 `sanitizeConfig` 会把它从 `/api/config` 的返回里抹掉（换成恒真的 `hasBlockOnSecrets`），所以这一项只能在 `data/config.json` 里改，界面上放不了 |
 | `blockedReply` | 一句中文提示 | 回程被拒发时，替换成这句话发给对方 |
 | `noticeSuffix` | false | 打码时是否在末尾附一句"已隐去 N 处" |
 | `logMatches` | true | 命中时在日志留痕：**只记规则名和次数，不记内容** |
