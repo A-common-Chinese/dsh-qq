@@ -30,3 +30,6 @@
         # 是否注册 qq_send 工具（让任意 DSH 会话都能往 QQ 推消息）
         enableSendTool: true
         sendToolName: qq_send
+        # DSH → QQ 发文件（群文件 / 私聊文件）
+        enableSendFileTool: true
+        sendFileToolName: qq_send_file

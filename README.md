@@ -11,6 +11,7 @@ QQ ↔ DeepSeek Harness 桥的 **DSH 侧**插件：让 QQ 里的对话落到一�
 | `POST /__dsh-qq/message` | body `{ chatKey, text }`。插件按 `chatKey` 找（或建）一个常驻 agent，追加一轮对话，等它跑完，返回 `{ ok, reply, sessionId, elapsedMs, turns }`。**同一个 chatKey 的多轮共享上下文**，不新起进程。 |
 | `GET /__dsh-qq/status` | 列出当前常驻会话（chatKey / sessionId / busy / turns）。 |
 | 工具 `qq_send` | 任意 DSH 会话都能调用：`{ chat: "private:<QQ号>" \| "group:<群号>", text }` → 调 QQ Agent 的 `POST /api/inbound` 发出去。 |
+| 工具 `qq_send_file` | 同上，但发**文件**：`{ chat, path, name? }` → QQ Agent 的 `POST /api/inbound-file` → OneBot `upload_group_file` / `upload_private_file`。`path` 必须是本机（跑 QQ Agent 那台）上存在的绝对路径，受 `dsh.maxFileBytes` 与 `dsh.fileRoots` 约束。 |
 
 ## 配置（profile 的 cordis.patch.yml，或 GUI 插件页）
 

@@ -59,7 +59,9 @@ const DEFAULTS = {
   qqBaseUrl: 'http://127.0.0.1:3310',
   qqToken: '',
   enableSendTool: true,
-  sendToolName: 'qq_send'
+  sendToolName: 'qq_send',
+  enableSendFileTool: true,
+  sendFileToolName: 'qq_send_file'
 };
 
 let Schema = null;
@@ -87,7 +89,9 @@ export const Config = Schema
       qqBaseUrl: Schema.string().default(DEFAULTS.qqBaseUrl),
       qqToken: Schema.string().default(''),
       enableSendTool: Schema.boolean().default(true),
-      sendToolName: Schema.string().default(DEFAULTS.sendToolName)
+      sendToolName: Schema.string().default(DEFAULTS.sendToolName),
+      enableSendFileTool: Schema.boolean().default(true),
+      sendFileToolName: Schema.string().default(DEFAULTS.sendFileToolName)
     })
   : undefined;
 
@@ -260,7 +264,12 @@ export function apply(ctx, config) {
     entry.lastUsed = Date.now();
     const startedAt = Date.now();
     try {
-      entry.agent.followup(userMessage(text));
+      // 桥注入上下文：告诉模型"这次请求来自哪个 QQ 会话"。没有它模型就没有 chatKey，
+      // qq_send / qq_send_file 只能瞎编或反过来问用户。方括号里是系统提示，不是用户的话。
+      entry.agent.followup(userMessage(
+        text + '\n\n[QQ 桥提示：本次请求来自 ' + chatKey
+        + '。若要把消息或文件发回该会话，调用 qq_send / qq_send_file 时 chat 参数填 \"' + chatKey + '\"。]'
+      ));
       await withTimeout(entry.agent.whenIdle(), Number(cfg.replyTimeoutMs) || 0, () => {
         try { entry.agent.cancel({ kind: 'user' }); } catch { /* 尽力取消 */ }
       });
@@ -276,6 +285,27 @@ export function apply(ctx, config) {
     } finally {
       entry.busy = false;
     }
+  }
+
+  /** DSH → QQ：把本机文件发到 QQ（走 QQ Agent 的 /api/inbound-file）。 */
+  async function sendFileToQQ(chat, filePath, name) {
+    const base = String(cfg.qqBaseUrl || '').replace(/\/+$/, '');
+    if (!base) throw new Error('dsh-qq: qqBaseUrl 未配置');
+    const response = await fetch(base + '/api/inbound-file', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...(cfg.qqToken ? { 'x-console-token': String(cfg.qqToken) } : {})
+      },
+      body: JSON.stringify({ chat: String(chat), path: String(filePath), ...(name ? { name: String(name) } : {}) }),
+      // 上传可能是几百 MB，超时给足
+      signal: AbortSignal.timeout(300000)
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok || body?.ok === false) {
+      throw new Error(body?.error ? String(body.error) : `HTTP ${response.status}`);
+    }
+    return body;
   }
 
   /** DSH → QQ：调用 QQ Agent 的 /api/inbound。 */
@@ -401,6 +431,57 @@ export function apply(ctx, config) {
       })
     );
     log(`工具已注册：${cfg.sendToolName}（→ ${cfg.qqBaseUrl}/api/inbound）`);
+  }
+
+  // ── qq_send_file 工具：把本机文件发到 QQ（群文件 / 私聊文件）────────────
+  if (cfg.enableSendFileTool !== false) {
+    ctx.effect(() =>
+      ctx.tools.register({
+        name: String(cfg.sendFileToolName || 'qq_send_file'),
+        description:
+          'Send a local file to a QQ chat through the local QQ Agent (group file / private file). ' +
+          'Use it to deliver a document, archive, screenshot or build artifact to the human on QQ. ' +
+          '`chat` must be "group:<群号>" or "private:<QQ号>" and already whitelisted; ' +
+          '`path` must be an absolute path to an existing file on the machine running the QQ Agent.',
+        parameters: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['chat', 'path'],
+          properties: {
+            chat: { type: 'string', description: '"group:<群号>" 或 "private:<QQ号>"' },
+            path: { type: 'string', description: '本机文件的绝对路径（必须存在）' },
+            name: { type: 'string', description: '在 QQ 里显示的文件名；留空用原文件名' }
+          }
+        },
+        output: {
+          schema: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['ok', 'chat', 'name', 'fileId'],
+            properties: {
+              ok: { type: 'boolean' },
+              chat: { type: 'string' },
+              name: { type: 'string' },
+              fileId: { type: 'string' }
+            }
+          },
+          render: (_args, value) => [
+            { type: 'text', text: value?.ok ? `已发送文件 ${value.name} 到 ${value.chat}` : `发送失败：${value?.chat ?? ''}` }
+          ]
+        },
+        isConcurrencySafe: () => true,
+        async execute(args) {
+          const result = await sendFileToQQ(args.chat, args.path, args.name);
+          return {
+            ok: true,
+            chat: String(args.chat),
+            name: String(result?.name ?? args.name ?? ''),
+            fileId: String(result?.fileId ?? '')
+          };
+        }
+      })
+    );
+    log(`工具已注册：${cfg.sendFileToolName}（→ ${cfg.qqBaseUrl}/api/inbound-file）`);
   }
 
   // ── 空闲回收 + 卸载清理 ─────────────────────────────────────────────────
