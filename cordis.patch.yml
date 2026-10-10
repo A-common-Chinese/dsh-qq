@@ -1,0 +1,32 @@
+# dsh-qq 插件行：装进 profile 后由 Cordis 加载。
+# 改完这里的 config 后用 `dsh <profile> --dump-config` 或直接在 GUI 的插件页改；
+# 注意：本插件的 index.js 是 ESM，宿主会缓存模块 —— **改源码必须重启 DSH**，
+# 但改 config（含 GUI 里改）不需要重启。
+
+- insert:
+    - id: dsh-qq
+      name: dsh-qq
+      config:
+        # 关掉后：不挂路由、不注册工具（整插件静默）
+        enabled: true
+        # QQ 侧桥调用的入口（POST { chatKey, text, senderId }）
+        routePath: /__dsh-qq/message
+        statusPath: /__dsh-qq/status
+        # 共享密钥：QQ 侧用 x-dsh-qq-token 头带上。留空 = 只靠回环地址保护（本机任何进程可调）
+        bridgeToken: ''
+        # 常驻会话的工作目录；留空 = 继承宿主进程 cwd
+        cwd: C:\Users\noapi\dsh-workspace
+        # 留空则用 DSH 的默认模型选择
+        provider: ''
+        model: ''
+        reasoningEffort: ''
+        maxTokens: 0
+        # 单条消息等待上限 / 空闲多久回收常驻 agent
+        replyTimeoutMs: 900000
+        idleDisposeMs: 1800000
+        # QQ Agent 的控制台地址（DSH → QQ 推送用）
+        qqBaseUrl: http://127.0.0.1:3310
+        qqToken: ''
+        # 是否注册 qq_send 工具（让任意 DSH 会话都能往 QQ 推消息）
+        enableSendTool: true
+        sendToolName: qq_send
