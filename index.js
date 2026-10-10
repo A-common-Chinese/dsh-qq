@@ -64,6 +64,20 @@ const DEFAULTS = {
   enableSendFileTool: true,
   sendFileToolName: 'qq_send_file',
   /**
+   * 常驻 agent 挂哪个 agent 预设（**工具面**就是它决定的）。
+   * 程序化创建的会话 agentPreset 为空时只有全局插件工具 —— 没有 pwsh/fs/技能，
+   * 所以 QQ 那边让机器人"关机/跑命令"会直接回"我没有命令执行能力"。
+   * 官方预设：standard / ptc / minimal / cordis；也可以填自定义预设（如 webcode）。
+   */
+  agentPreset: 'standard',
+  /**
+   * 常驻会话的权限预设（沙箱 + 审批）。'' = 用部署的 defaultPreset。
+   * 想让 QQ 那边的任务能越界操作（例如关机），需要 danger-full-access
+   * （sandbox=danger-full-access, approval=never）—— 否则越界命令会转审批，
+   * 而常驻会话里没人应答审批 = 自动拒绝。QQ 侧请求可带 permissionPreset 单轮覆盖。
+   */
+  permissionPreset: '',
+  /**
    * 隐私过滤（细节在 privacy.js）：
    *   · allowedChats 里的会话（默认只有你的私聊）—— 原样放行，一个字都不动；
    *   · 其他任何会话（所有群 + 其他私聊）—— 命中即处理：
@@ -114,6 +128,8 @@ export const Config = Schema
       sendToolName: Schema.string().default(DEFAULTS.sendToolName),
       enableSendFileTool: Schema.boolean().default(true),
       sendFileToolName: Schema.string().default(DEFAULTS.sendFileToolName),
+      agentPreset: Schema.string().default(DEFAULTS.agentPreset),
+      permissionPreset: Schema.string().default(''),
       // 注意：profile 里只有 @deepseek-ai/schemastery，裸名 import 会失败 → Config 实际为
       // undefined，配置原样传入。这里仍然声明一遍，是为了将来 schema 真能解析时不被剥掉字段。
       privacy: Schema.object({
@@ -259,20 +275,83 @@ export function apply(ctx, config) {
     saveChatState(chatState);
   }
 
+  /**
+   * 给一个常驻 agent 挂上 agent 预设（工具面在这里）。
+   *
+   * 为什么必须显式挂：程序化创建的会话 agentPreset=null，只会拿到**全局注册的插件工具**
+   * （QQ/Blender/WorkBuddy…），而 pwsh / fs / 技能这些核心工具是**预设里的一组插件的组合**。
+   * 表现就是常驻会话"没有 shell 工具"，连 shutdown 都执行不了。
+   * 预设名由部署决定：官方 standard / ptc / minimal / cordis，用户自定义的如 webcode。
+   */
+  async function applyAgentPreset(entry, why) {
+    const wanted = String(cfg.agentPreset || '').trim();
+    if (!wanted) return;
+    const presets = typeof ctx.get === 'function' ? ctx.get('agentPresets') : null;
+    if (!presets || typeof presets.select !== 'function') {
+      log(`⚠️ 无法应用 agentPreset=${wanted}：本进程没有 agentPresets 服务`);
+      return;
+    }
+    try {
+      const before = typeof presets.composedPreset === 'function'
+        ? presets.composedPreset(entry.agent.ctx ?? ctx)
+        : undefined;
+      const applied = await presets.select(entry.agent, wanted);
+      entry.agentPreset = applied || wanted;
+      log(`agent 预设已应用（${why}）：${before ?? '(无)'} → ${entry.agentPreset}`);
+    } catch (error) {
+      log(`⚠️ 应用 agentPreset=${wanted} 失败：${error?.message ?? error}`);
+    }
+  }
+
+  /**
+   * 把一条会话切到权限预设（沙箱 + 审批一起换）。不切的话，常驻会话是
+   * workspace-write + approval=ask：越界命令（比如关机）会转成审批，而这类会话里
+   * 没人应答审批 = 自动拒绝，表现就是"没有权限"。
+   */
+  function applyPermissionPreset(entry, wanted, why) {
+    const name = String(wanted || '').trim();
+    if (!name) return;
+    const perms = typeof ctx.get === 'function' ? ctx.get('permissionPresets') : null;
+    if (!perms || typeof perms.set !== 'function') {
+      log(`⚠️ 无法应用 permissionPreset=${name}：本进程没有 permissionPresets 服务`);
+      return;
+    }
+    const session = entry.agent.session ?? ctx.sessions?.get?.(entry.agent.id);
+    if (!session) {
+      log(`⚠️ 无法应用 permissionPreset=${name}：拿不到 session`);
+      return;
+    }
+    try {
+      const current = typeof perms.current === 'function' ? perms.current(session) : undefined;
+      if (current === name) return;
+      perms.set(session, name);
+      log(`权限预设已切换（${why}）：${current ?? '(未知)'} → ${name}`);
+    } catch (error) {
+      log(`⚠️ 应用 permissionPreset=${name} 失败：${error?.message ?? error}`);
+    }
+  }
+
   async function createChat(chatKey) {
     const safe = String(chatKey).replace(/[^A-Za-z0-9_-]+/g, '_').slice(0, 48);
     const sessionId = `qq-${safe}-${randomUUID().slice(0, 8)}`;
     const agentOptions = resolveAgentOptions();
+    const presetName = String(cfg.agentPreset || '').trim();
     const handle = await ctx.agents.create({
       sessionId,
-      meta: cfg.cwd ? { cwd: String(cfg.cwd) } : {},
+      meta: {
+        ...(cfg.cwd ? { cwd: String(cfg.cwd) } : {}),
+        // 建会话时就带上预设，比建完再 select 更干净；后面那次 select 是兜底
+        ...(presetName ? { agentPreset: presetName } : {})
+      },
       ...(Object.keys(agentOptions).length ? { agentOptions } : {})
     });
     const model = `${agentOptions.provider ?? '?'}/${agentOptions.model ?? '?'}`;
     const entry = { handle, agent: handle.agent, busy: false, lastUsed: Date.now(), turns: 0, sessionId, model };
     chats.set(chatKey, entry);
     rememberSession(chatKey, sessionId);
-    log(`新建常驻会话 ${chatKey} → ${sessionId}（model=${model}）`);
+    log(`新建常驻会话 ${chatKey} → ${sessionId}（model=${model}${presetName ? `，preset=${presetName}` : ''}）`);
+    await applyAgentPreset(entry, '新建会话兜底');
+    applyPermissionPreset(entry, cfg.permissionPreset, '新建会话');
     return entry;
   }
 
@@ -291,6 +370,9 @@ export function apply(ctx, config) {
         const entry = { handle, agent: handle.agent, busy: false, lastUsed: Date.now(), turns: 0, sessionId: saved, model };
         chats.set(chatKey, entry);
         log(`复用持久会话 ${chatKey} → ${saved}（model=${model}）`);
+        // 恢复出来的老会话可能是"没预设/旧预设"的：补挂一次，这样不用清会话映射
+        await applyAgentPreset(entry, '恢复会话');
+        applyPermissionPreset(entry, cfg.permissionPreset, '恢复会话');
         return entry;
       } catch (error) {
         log(`恢复会话 ${saved} 失败（${error?.message ?? error}），改建新会话`);
@@ -300,8 +382,11 @@ export function apply(ctx, config) {
   }
 
   /** 一轮问答：追加 user 消息 → 等空闲 → 取最后一条 assistant 文本。 */
-  async function ask(chatKey, text) {
+  async function ask(chatKey, text, options = {}) {
     const entry = await ensureChat(chatKey);
+    // 权限预设可以在单轮请求里指定（QQ 控制台的 permissionMode 会带过来）：
+    // 这样**已经存在的**老会话也能就地升级，不必清掉会话映射、不丢上下文。
+    applyPermissionPreset(entry, options?.permissionPreset || cfg.permissionPreset, '本轮请求');
     if (entry.busy) throw new Error('这个会话上一轮还没跑完（QQ 侧可以发 /dsh 停）');
     entry.busy = true;
     entry.lastUsed = Date.now();
@@ -402,7 +487,9 @@ export function apply(ctx, config) {
         const text = String(body.text ?? '').trim();
         if (!chatKey || !text) return sendJson(res, 400, { ok: false, error: '缺少 chatKey 或 text' });
         try {
-          const result = await ask(chatKey, text);
+          const result = await ask(chatKey, text, {
+            permissionPreset: typeof body.permissionPreset === 'string' ? body.permissionPreset : ''
+          });
           log(`← ${chatKey} 一轮完成（${result.elapsedMs}ms，第 ${result.turns} 轮）`);
           // ── 隐私闸门：这条回程是主要泄漏面（别人问，DSH 答，答案落进那个会话）──
           const gate = privacy.filterText(chatKey, result.reply);
@@ -619,5 +706,24 @@ export function apply(ctx, config) {
     );
   } else {
     log('⚠️ 隐私过滤已关闭（privacy.enabled=false）：任何会话都会收到原样内容');
+  }
+
+  // 预设自检：把"到底挂了什么、本机有哪些可选"打出来，省得再猜为什么没有某类工具
+  log(`agent 预设=${cfg.agentPreset || '(不挂，只有全局插件工具)'}，权限预设=${cfg.permissionPreset || '(用部署 defaultPreset)'}`);
+  try {
+    const presetSvc = typeof ctx.get === 'function' ? ctx.get('agentPresets') : null;
+    if (presetSvc && typeof presetSvc.list === 'function') {
+      Promise.resolve(presetSvc.list())
+        .then((list) => log('可用 agent 预设：' + (Array.isArray(list) ? list.map((p) => p?.id ?? p).join('、') : String(list))))
+        .catch(() => {});
+    }
+    const permSvc = typeof ctx.get === 'function' ? ctx.get('permissionPresets') : null;
+    if (permSvc && typeof permSvc.catalog === 'function') {
+      const cat = permSvc.catalog();
+      const names = [...(cat?.options ?? []), ...(cat?.defaultOptions ?? [])].map((o) => o?.value).filter(Boolean);
+      log('可用权限预设：' + [...new Set(names)].join('、') + '（默认 ' + (cat?.defaultPreset ?? '?') + '）');
+    }
+  } catch (error) {
+    log(`预设自检失败（不影响运行）：${error?.message ?? error}`);
   }
 }
