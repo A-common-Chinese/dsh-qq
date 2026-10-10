@@ -20,6 +20,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createPrivacyFilter } from './privacy.js';
+import { pickPermissionPreset } from './permission-policy.js';
 
 /**
  * chatKey → sessionId 的持久映射。有了它，DSH 重启/插件重载后同一个 QQ 会话还能
@@ -77,6 +78,15 @@ const DEFAULTS = {
    * 而常驻会话里没人应答审批 = 自动拒绝。QQ 侧请求可带 permissionPreset 单轮覆盖。
    */
   permissionPreset: '',
+  /**
+   * **谁能拿到全权限**（默认只有你那条私聊）。裸 QQ 号按私聊算；群要显式写 group:<群号>。
+   * 不在白名单里的会话一律走 restrictedPermissionPreset —— 因为部署的 defaultPreset
+   * 现在是 danger-full-access，不显式降级它们就会一起拿到全权限。
+   * 空数组 = 任何会话都不给全权限（fail-closed）。
+   */
+  permissionAllowedChats: ['private:85946573'],
+  /** 非白名单会话用哪一档；'' = 不动（不建议：会继承部署的 defaultPreset）。 */
+  restrictedPermissionPreset: 'workspace-write',
   /**
    * 恢复老会话时预设挂不上怎么办：'warn' = 只告警（保持上下文，但没有 shell 工具）；
    * 'recreate' = 弃用旧会话、新建一个（一定有工具，代价是丢这条 QQ 会话的上下文）。
@@ -136,6 +146,8 @@ export const Config = Schema
       sendFileToolName: Schema.string().default(DEFAULTS.sendFileToolName),
       agentPreset: Schema.string().default(DEFAULTS.agentPreset),
       permissionPreset: Schema.string().default(''),
+      permissionAllowedChats: Schema.array(Schema.string()).default(DEFAULTS.permissionAllowedChats),
+      restrictedPermissionPreset: Schema.string().default(DEFAULTS.restrictedPermissionPreset),
       // 注意：profile 里只有 @deepseek-ai/schemastery，裸名 import 会失败 → Config 实际为
       // undefined，配置原样传入。这里仍然声明一遍，是为了将来 schema 真能解析时不被剥掉字段。
       privacy: Schema.object({
@@ -333,29 +345,45 @@ export function apply(ctx, config) {
    * 把一条会话切到权限预设（沙箱 + 审批一起换）。不切的话，常驻会话是
    * workspace-write + approval=ask：越界命令（比如关机）会转成审批，而这类会话里
    * 没人应答审批 = 自动拒绝，表现就是"没有权限"。
+   *
+   * **按会话白名单决定用哪一档**（判定在 permission-policy.js，有单测）：
+   *   · 白名单会话（默认 private:85946573）→ 全权限（permissionPreset / 请求参数）
+   *   · 其他会话（所有群、其他私聊）      → 显式降级（restrictedPermissionPreset）
+   * 注意非白名单**必须显式降级**：部署的 defaultPreset 现在是 danger-full-access，
+   * 不显式降的话它们也会跟着拿到全权限。
    */
-  function applyPermissionPreset(entry, wanted, why) {
-    const name = String(wanted || '').trim();
-    if (!name) return;
+  function applyPermissionPreset(entry, chatKey, requested, why) {
+    const decision = pickPermissionPreset(chatKey, {
+      allowedChats: cfg.permissionAllowedChats,
+      full: requested || cfg.permissionPreset,
+      restricted: cfg.restrictedPermissionPreset
+    });
+    const name = String(decision.name || '').trim();
+    if (!name) {
+      entry.permissionNote = `不动（${decision.reason}）`;
+      return;
+    }
     const perms = typeof ctx.get === 'function' ? ctx.get('permissionPresets') : null;
     if (!perms || typeof perms.set !== 'function') {
+      entry.permissionNote = `无法应用 ${name}：本进程没有 permissionPresets 服务`;
       log(`⚠️ 无法应用 permissionPreset=${name}：本进程没有 permissionPresets 服务`);
       return;
     }
     const session = entry.agent.session ?? ctx.sessions?.get?.(entry.agent.id);
     if (!session) {
+      entry.permissionNote = `无法应用 ${name}：拿不到 session`;
       log(`⚠️ 无法应用 permissionPreset=${name}：拿不到 session`);
       return;
     }
     try {
       const current = typeof perms.current === 'function' ? perms.current(session) : undefined;
       if (current === name) {
-        entry.permissionNote = `${name}（已是）`;
+        entry.permissionNote = `${name}（已是；${decision.reason}）`;
         return;
       }
       perms.set(session, name);
-      entry.permissionNote = `${current ?? '(未知)'} → ${name}（${why}）`;
-      log(`权限预设已切换（${why}）：${current ?? '(未知)'} → ${name}`);
+      entry.permissionNote = `${current ?? '(未知)'} → ${name}（${why}；${decision.reason}）`;
+      log(`权限预设已切换（${why}）：${current ?? '(未知)'} → ${name}｜${decision.reason}`);
     } catch (error) {
       entry.permissionNote = `切换 ${name} 失败：${error?.message ?? error}`;
       log(`⚠️ 应用 permissionPreset=${name} 失败：${error?.message ?? error}`);
@@ -382,7 +410,7 @@ export function apply(ctx, config) {
     rememberSession(chatKey, sessionId);
     log(`新建常驻会话 ${chatKey} → ${sessionId}（model=${model}${presetName ? `，preset=${presetName}` : ''}）`);
     await applyAgentPreset(entry, '新建会话兜底');
-    applyPermissionPreset(entry, cfg.permissionPreset, '新建会话');
+    applyPermissionPreset(entry, chatKey, '', '新建会话');
     return entry;
   }
 
@@ -403,7 +431,7 @@ export function apply(ctx, config) {
         log(`复用持久会话 ${chatKey} → ${saved}（model=${model}）`);
         // 恢复出来的老会话可能是"没预设/旧预设"的：补挂一次，这样不用清会话映射
         await applyAgentPreset(entry, '恢复会话');
-        applyPermissionPreset(entry, cfg.permissionPreset, '恢复会话');
+        applyPermissionPreset(entry, chatKey, '', '恢复会话');
         // 兜底：预设挂不上 ⇒ 这个会话拿不到 shell 这类核心工具。是否"弃用旧会话、按新代码新建一个"
         // 由配置决定：warn（默认，只告警）| recreate（新建，代价是丢这条会话的上下文）。
         // 新建那条路用 meta.agentPreset，实测一定能带上工具。
@@ -429,7 +457,7 @@ export function apply(ctx, config) {
     const entry = await ensureChat(chatKey);
     // 权限预设可以在单轮请求里指定（QQ 控制台的 permissionMode 会带过来）：
     // 这样**已经存在的**老会话也能就地升级，不必清掉会话映射、不丢上下文。
-    applyPermissionPreset(entry, options?.permissionPreset || cfg.permissionPreset, '本轮请求');
+    applyPermissionPreset(entry, chatKey, options?.permissionPreset || '', '本轮请求');
     if (entry.busy) throw new Error('这个会话上一轮还没跑完（QQ 侧可以发 /dsh 停）');
     entry.busy = true;
     entry.lastUsed = Date.now();
@@ -603,6 +631,8 @@ export function apply(ctx, config) {
             permissionPreset: cfg.permissionPreset || '',
             availableAgentPresets,
             availablePermissionPresets,
+            allowedChats: Array.isArray(cfg.permissionAllowedChats) ? cfg.permissionAllowedChats : [],
+            restrictedPermissionPreset: cfg.restrictedPermissionPreset || '',
             defaultPermissionPreset
           },
           chats: [...chats.entries()].map(([chatKey, e]) => ({

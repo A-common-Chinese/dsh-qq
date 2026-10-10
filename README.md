@@ -27,6 +27,11 @@ QQ ↔ DeepSeek Harness 桥的 **DSH 侧**插件：让 QQ 里的对话落到一�
 | `qqBaseUrl` / `qqToken` | `http://127.0.0.1:3310` / `''` | DSH → QQ 推送的目标（QQ Agent 控制台）。qqToken 对应 QQ 侧的 `server.token` |
 | `enableSendTool` / `sendToolName` | true / `qq_send` | 是否注册推送工具 |
 | `privacy` | 见下 | 出站隐私过滤（白名单外会话不许收到隐私信息） |
+| `agentPreset` | `standard` | 常驻会话挂哪个 **agent 预设**（= 工具面）。留空 = 只拿全局插件工具 |
+| `permissionPreset` | `''` | 常驻会话切到哪个**权限预设**。留空 = 用部署的 `defaultPreset` |
+| `permissionAllowedChats` | `['private:85946573']` | **谁能拿到全权限**。不在名单里的会话一律走 `restrictedPermissionPreset`（裸 QQ 号按私聊算；群要显式写 `group:<群号>`；空数组 = 谁都不给） |
+| `restrictedPermissionPreset` | `workspace-write` | 非白名单会话用哪一档 |
+| `onPresetFailure` | `warn` | 恢复老会话时预设挂不上怎么办（`warn` / `recreate`），见"工具面与权限"一节 |
 
 ## 隐私过滤（`privacy`）
 
@@ -59,6 +64,101 @@ QQ ↔ DeepSeek Harness 桥的 **DSH 侧**插件：让 QQ 里的对话落到一�
 > 因为 fork 才是所有 DSH 内容落到 QQ 的咽喉（`/api/inbound` + 桥回传回复都经它的 sender 出去），
 > 而且改 fork 只要重启 QQ Agent、不必重启 DSH。两层互为兜底。
 
+
+## 常驻会话的「工具面」与「权限」（`agentPreset` / `permissionPreset`）
+
+`/dsh` 的常驻会话是**程序化创建**的 agent，它的能力由两件事决定，而且**都不吃 DSH 的全局默认**。
+本机实测（2026-10-11）：用户问"让机器人帮我关机"，常驻会话回的是
+「我没有命令执行能力——本次会话未给我任何 shell/PowerShell 工具」。查下来是下面两层。
+
+### ① 工具面 = agent 预设（`agentPreset`）
+
+`agentPreset` 为空时，会话只拿到**全局注册的插件工具**（qq_send / Blender / WorkBuddy /
+workflow / timer / Steam++…）；而 `pwsh` / `fs` / `fs-search` / skills / plan-mode 这些核心工具
+是 **agent 预设里的一组插件的组合**。预设由 `@deepseek-ai/dsh-agent-preset` 声明，
+本机可选（直接读 `/__dsh-qq/status`）：`standard`、`ptc`、`minimal`、`cordis`、`webcode`。
+
+| 场景 | 正确做法 | 实测结论 |
+|---|---|---|
+| **新建**会话 | `ctx.agents.create({ meta: { agentPreset } })` | ✅ 有效：投影 `agentPreset="standard"`，工具立刻可用 |
+| **恢复**会话 | `ResumeAgentOptions` **没有** `meta`，只能事后挂：`ctx.agentPresets.mount(agent.ctx, id)` | ✅ `mount` 有效（`presetNote="mount 成功（恢复会话）"`）；❌ `agentPresets.select(agent, id)` 对**已存在的 agent 不起作用**（投影仍 `null`、工具也没有） |
+
+所以插件两条路都做：create 带 `meta.agentPreset`；resume 依次试 `mount → select → recompose`，
+结果写进 `entry.presetNote`。`mount` 会把预设里的插件挂进 `agent.ctx` —— **工具面就是在这一步出现的**
+（实测不会崩宿主）。
+
+### ② 权限 = 权限预设（`permissionPreset`）
+
+常驻会话被播种为 `{ sandbox: workspace-write, approval: ask }`：越界命令（`shutdown`、改系统设置…）
+会转成**审批请求**，而无人值守的常驻会话里**没有人应答审批 = 自动拒绝** —— 表现就是"没权限"。
+
+| 层级 | 做法 | 生效范围 |
+|---|---|---|
+| 部署级默认 | `@deepseek-ai/dsh-permission-presets` 的 `defaultPreset: danger-full-access`（写进 profile 的 `cordis.patch.yml`） | 之后**新建**的会话；配置热重载，不用重启 |
+| 单会话 | `ctx.permissionPresets.set(session, name)`（插件在 create / resume / **每一轮请求**各调一次） | 含**已存在**的会话 —— 就地切换，不丢上下文 |
+| 单轮 | 请求体带 `permissionPreset` | 只影响这一轮，**且只对白名单会话有效** |
+
+预设名：`read-only` / `workspace-write` / `danger-full-access`（后者 = 沙箱全开 + `approval: never`）。
+
+#### 按会话白名单分档（`permissionAllowedChats`）
+
+只有白名单里的会话能拿到全权限，其他会话**显式降级**。判定在
+[`permission-policy.js`](permission-policy.js)（纯函数，单测 `node test/permission-policy.test.mjs`，14 项）：
+
+| 会话 | 结果 |
+|---|---|
+| 在 `permissionAllowedChats` 里 | 用 `permissionPreset`（或请求参数），即全权限 |
+| 不在名单里（**所有群** + 其他私聊） | 用 `restrictedPermissionPreset`（默认 `workspace-write`） |
+| 名单为空数组 | 所有会话都受限（fail-closed） |
+
+关键点：**非白名单会话即使请求里硬塞 `permissionPreset: danger-full-access` 也会被降到受限档**（单测里有这条）。
+之所以必须显式降级：部署的 `defaultPreset` 已经是 `danger-full-access`，不降的话非白名单会话会跟着吃满权限。
+
+⚠️ 别把它和 `privacy.allowedChats` 混为一谈：那个管"谁能收到隐私信息"，这个管"谁能驱动这台机器"，
+两者互相独立（各自默认都是 `private:85946573`）。
+
+⚠️ **安全含义**：`danger-full-access` 等于把这台机器交给能从白名单 QQ 号下指令的人。
+QQ 侧的 `dsh.allowedSenderIds` 是唯一的门，务必只填自己的号。
+
+### 诊断接口（宿主不落盘插件的 console 输出，所以状态都搬到 HTTP 上）
+
+`GET /__dsh-qq/status` 会多返回：
+
+```jsonc
+{
+  "presets": {
+    "agentPreset": "standard",
+    "permissionPreset": "danger-full-access",
+    "availableAgentPresets": ["standard", "ptc", "minimal", "cordis", "webcode"],
+    "availablePermissionPresets": ["workspace-write", "danger-full-access"],
+    "defaultPermissionPreset": "danger-full-access"
+  },
+  "chats": [{ "chatKey": "private:85946573", "agentPreset": "standard",
+              "presetNote": "mount 成功（恢复会话）", "permissionNote": "danger-full-access（已是）" }]
+}
+```
+
+`POST /__dsh-qq/message` 的每轮响应里也带 `agentPreset` / `presetNote` / `permissionNote`，
+不用翻日志就能看出"这一轮到底挂上了什么"。
+
+### 排查清单（按顺序）
+
+1. `/__dsh-qq/status` → `presets.availableAgentPresets` 里有没有你配的那个名字；
+2. 发一条消息看响应里的 `presetNote`：`mount 成功（恢复会话）` / `全部失败 —— mount: …`；
+3. 会话投影 `<.dsh>/storages/session_projcache/sessions/<sessionId>.json`：
+   `agentPreset.val` 应为预设名，`permissions.val` 应为 `danger-full-access` + `never`；
+4. 安全的能力验证：让它执行 `shutdown /s /t 300` 再 `shutdown /a` —— 两行退出码都应为 0，
+   之后外部再跑 `shutdown /a` 应回 `(1116) no shutdown was in progress`（反证前面真排程过）。
+
+### 已知坑
+
+- **改 `index.js` 必须重启 DSH**（宿主缓存 ESM 模块）；改 `cordis.patch.yml` 的配置热重载即可。
+- **`select()` ≠ 挂预设**：对已存在的 agent 必须用 `mount`（这条卡了一晚上）。
+- **审批无人应答 = 拒绝**：任何走 `approval: ask` 的越界操作，在常驻会话里都等于直接失败。
+- **插件 `console.log` 不落盘**（Electron 主进程脱离控制台启动，stdout 丢掉）—— `logMatches`
+  曾经"看不出效果"就是这个原因（现已改成注入式 logger，并把状态搬到 HTTP）。
+- **重启 DSH 的拉起动作必须活在别的进程里**（本机用 WMI 创建 + 等待窗口要留足，如 600 秒），
+  否则"杀了没人拉起"会被误判成"Dsh 崩溃"。
 
 ## 安装 / 生效
 
