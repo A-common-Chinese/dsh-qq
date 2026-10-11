@@ -20,6 +20,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createPrivacyFilter } from './privacy.js';
+import { withBridgeHint } from './hint.js';
 import { pickPermissionPreset } from './permission-policy.js';
 
 /**
@@ -78,6 +79,10 @@ const DEFAULTS = {
    * 而常驻会话里没人应答审批 = 自动拒绝。QQ 侧请求可带 permissionPreset 单轮覆盖。
    */
   permissionPreset: '',
+  // 是否在每条投递给 DSH 的消息后附加 QQ 桥提示（含：需要用户决策就用 qq_send 发回去）。
+  bridgeHint: true,
+  // 自定义提示文案；留空 = 用 hint.js 里的内置文案。
+  decisionHint: '',
   /**
    * **谁能拿到全权限**（默认只有你那条私聊）。裸 QQ 号按私聊算；群要显式写 group:<群号>。
    * 不在白名单里的会话一律走 restrictedPermissionPreset —— 因为部署的 defaultPreset
@@ -146,6 +151,8 @@ export const Config = Schema
       sendFileToolName: Schema.string().default(DEFAULTS.sendFileToolName),
       agentPreset: Schema.string().default(DEFAULTS.agentPreset),
       permissionPreset: Schema.string().default(''),
+      bridgeHint: Schema.boolean().default(true),
+      decisionHint: Schema.string().default(''),
       permissionAllowedChats: Schema.array(Schema.string()).default(DEFAULTS.permissionAllowedChats),
       restrictedPermissionPreset: Schema.string().default(DEFAULTS.restrictedPermissionPreset),
       // 注意：profile 里只有 @deepseek-ai/schemastery，裸名 import 会失败 → Config 实际为
@@ -463,13 +470,15 @@ export function apply(ctx, config) {
     entry.lastUsed = Date.now();
     const startedAt = Date.now();
     try {
-      // 桥注入上下文：告诉模型"这次请求来自哪个 QQ 会话"。没有它模型就没有 chatKey，
-      // qq_send / qq_send_file 只能瞎编或反过来问用户。方括号里是系统提示，不是用户的话。
-      entry.agent.followup(userMessage(
-        text + '\n\n[QQ 桥提示：本次请求来自 ' + chatKey
-        + '。若要把消息或文件发回该会话，调用 qq_send / qq_send_file 时 chat 参数填 \"' + chatKey + '\"。]'
-      ));
-      await withTimeout(entry.agent.whenIdle(), Number(cfg.replyTimeoutMs) || 0, () => {
+      // 桥注入上下文（见 hint.js）：告诉模型这次请求来自哪个 QQ 会话，并明确
+      // 一件事：**用户看不见这个窗口** —— 需要用户确认/选择/补充信息时，要用
+      // qq_send 把问题发回该会话，然后结束本轮等回复；不要走界面询问
+      // （ask_user_question 之类 QQ 侧完全看不到，表现就是"QQ 里没反应"）。
+      // 方括号里是系统提示，不是用户的话；可用 bridgeHint / decisionHint 配置调整。
+      entry.agent.followup(userMessage(withBridgeHint(text, chatKey, {
+        enabled: cfg.bridgeHint !== false,
+        custom: cfg.decisionHint
+      })));      await withTimeout(entry.agent.whenIdle(), Number(cfg.replyTimeoutMs) || 0, () => {
         try { entry.agent.cancel({ kind: 'user' }); } catch { /* 尽力取消 */ }
       });
       const session = entry.agent.session ?? ctx.sessions.get(entry.agent.id);

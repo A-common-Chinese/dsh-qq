@@ -31,7 +31,43 @@ QQ ↔ DeepSeek Harness 桥的 **DSH 侧**插件：让 QQ 里的对话落到一�
 | `permissionPreset` | `''` | 常驻会话切到哪个**权限预设**。留空 = 用部署的 `defaultPreset` |
 | `permissionAllowedChats` | `['private:85946573']` | **谁能拿到全权限**。不在名单里的会话一律走 `restrictedPermissionPreset`（裸 QQ 号按私聊算；群要显式写 `group:<群号>`；空数组 = 谁都不给） |
 | `restrictedPermissionPreset` | `workspace-write` | 非白名单会话用哪一档 |
+| `bridgeHint` | `true` | 是否在每条投递给 DSH 的消息后附加「QQ 桥提示」（见下节） |
+| `decisionHint` | `''` | 自定义提示文案；留空 = 用 `hint.js` 里的内置文案 |
 | `onPresetFailure` | `warn` | 恢复老会话时预设挂不上怎么办（`warn` / `recreate`），见"工具面与权限"一节 |
+
+## 「QQ 桥提示」：为什么必须把"要问用户就用 qq_send"写进每条消息
+
+**症状**：QQ 里发出一条消息后很久没有反应，最后超时；而 DSH 窗口里赫然躺着一个提问。
+
+**成因**：常驻会话是 headless 的，模型看不到"用户其实在 QQ 里"。它一旦要用户做决策，最自然的动作是用
+**界面询问**（`ask_user_question` 之类）—— 那个问题只出现在 DSH 窗口里，QQ 侧完全看不到；
+而桥这边的 `ask()` 还在等这一轮结束，所以表现为"没反应"，直到 `replyTimeoutMs` 超时。
+
+**修法**：每条投递给 DSH 的消息末尾附一段系统提示（`hint.js` 组装，用户正文一字不动）：
+
+```
+[QQ 桥提示：本次请求来自 private:85946573。若要把消息或文件发回该会话，调用 qq_send / qq_send_file 时 chat 参数填 "private:85946573"。
+你的回复会自动发回该 QQ 会话 —— 需要用户确认/选择/补充信息时，直接把问题写进回复、然后结束本轮即可；
+不要用界面询问（ask_user_question 之类 QQ 侧完全看不到，表现为"没反应"）。
+若还要单独发额外内容或文件，用 qq_send / qq_send_file（chat 参数见上）。]
+```
+
+> 为什么强调"**直接把问题写进回复**"而不是"用 qq_send 问"：回复本来就会自动回到 QQ，
+> 让模型用 qq_send 再问一遍会让用户收到两条一样的消息。qq_send 留给"额外内容/文件"。
+
+- 顺带修掉另一个老问题：模型以前不知道 chatKey，`qq_send` 的 `chat` 参数只能瞎编；
+- 单测 `node test/hint.test.mjs`（15 项）：文案要点（含"回复会自动回到 QQ"与"别用界面询问"）、关掉开关、自定义文案、拼接格式；
+- 想改语气就填 `decisionHint`；彻底不要提示就设 `bridgeHint: false`。
+
+### 怎么确认它在运行中的实例里真的生效
+
+投影缓存里的 prompt 是**截断的**，看不出文案版本。可靠办法是让模型复述原文：
+
+```
+POST /__dsh-qq/message  { chatKey, text: "把这条消息的原文一字不改地复述出来（包括末尾方括号里的那段提示）" }
+```
+
+本机实测（2026-10-11）模型确实原样吐出了含"你的回复会自动发回该 QQ 会话 / ask_user_question"的整段提示。
 
 ## 隐私过滤（`privacy`）
 
