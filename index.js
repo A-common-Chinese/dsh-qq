@@ -22,6 +22,7 @@ import { join } from 'node:path';
 import { createPrivacyFilter } from './privacy.js';
 import { withBridgeHint } from './hint.js';
 import { pickPermissionPreset } from './permission-policy.js';
+import { decideRotation, rotationText } from './rotation-policy.js';
 
 /**
  * chatKey → sessionId 的持久映射。有了它，DSH 重启/插件重载后同一个 QQ 会话还能
@@ -59,6 +60,10 @@ const DEFAULTS = {
   maxTokens: 0,
   replyTimeoutMs: 900000,
   idleDisposeMs: 1800000,
+  // 常驻会话轮换：每轮都要把整条上下文重发一次，轮数一多成本近似二次增长，所以要能自动换新会话。
+  maxTurnsPerSession: 20,      // 累计轮数到达就换新会话（0 = 关掉这条规则）
+  maxSessionIdleHours: 12,     // 距上次使用超过这么多小时就换新会话（0 = 关掉）
+  rotateNotice: true,         // 轮换时在回复末尾附一句说明
   qqBaseUrl: 'http://127.0.0.1:3310',
   qqToken: '',
   enableSendTool: true,
@@ -143,6 +148,9 @@ export const Config = Schema
       maxTokens: Schema.number().default(0),
       replyTimeoutMs: Schema.number().default(DEFAULTS.replyTimeoutMs),
       idleDisposeMs: Schema.number().default(DEFAULTS.idleDisposeMs),
+      maxTurnsPerSession: Schema.number().default(DEFAULTS.maxTurnsPerSession),
+      maxSessionIdleHours: Schema.number().default(DEFAULTS.maxSessionIdleHours),
+      rotateNotice: Schema.boolean().default(DEFAULTS.rotateNotice),
       qqBaseUrl: Schema.string().default(DEFAULTS.qqBaseUrl),
       qqToken: Schema.string().default(''),
       enableSendTool: Schema.boolean().default(true),
@@ -295,8 +303,8 @@ export function apply(ctx, config) {
 
   const chatState = loadChatState();
 
-  function rememberSession(chatKey, sessionId) {
-    chatState[chatKey] = { sessionId, updatedAt: Date.now() };
+  function rememberSession(chatKey, sessionId, extra = {}) {
+    chatState[chatKey] = { ...(chatState[chatKey] || {}), sessionId, updatedAt: Date.now(), ...extra };
     saveChatState(chatState);
   }
 
@@ -414,7 +422,7 @@ export function apply(ctx, config) {
     const model = `${agentOptions.provider ?? '?'}/${agentOptions.model ?? '?'}`;
     const entry = { handle, agent: handle.agent, busy: false, lastUsed: Date.now(), turns: 0, sessionId, model };
     chats.set(chatKey, entry);
-    rememberSession(chatKey, sessionId);
+    rememberSession(chatKey, sessionId, { turns: 0, lastUsedAt: Date.now() });
     log(`新建常驻会话 ${chatKey} → ${sessionId}（model=${model}${presetName ? `，preset=${presetName}` : ''}）`);
     await applyAgentPreset(entry, '新建会话兜底');
     applyPermissionPreset(entry, chatKey, '', '新建会话');
@@ -433,7 +441,12 @@ export function apply(ctx, config) {
           ...(Object.keys(agentOptions).length ? { agentOptions } : {})
         });
         const model = `${agentOptions.provider ?? '?'}/${agentOptions.model ?? '?'}`;
-        const entry = { handle, agent: handle.agent, busy: false, lastUsed: Date.now(), turns: 0, sessionId: saved, model };
+        const entry = { handle, agent: handle.agent,
+          busy: false,
+          // 轮数与最近使用时间从持久状态恢复：DSH 重启后计数器不能归零，否则轮换永远不触发
+          lastUsed: Number(chatState[chatKey]?.lastUsedAt) || Date.now(),
+          turns: Number(chatState[chatKey]?.turns) || 0,
+          sessionId: saved, model };
         chats.set(chatKey, entry);
         log(`复用持久会话 ${chatKey} → ${saved}（model=${model}）`);
         // 恢复出来的老会话可能是"没预设/旧预设"的：补挂一次，这样不用清会话映射
@@ -459,9 +472,44 @@ export function apply(ctx, config) {
     return createChat(chatKey);
   }
 
+  /** 丢掉当前常驻会话并新建一条（轮换用）。 */
+  async function rotateChat(chatKey, entry, decision) {
+    const from = entry?.sessionId ?? "";
+    if (entry) { try { await entry.handle.dispose(); } catch { /* 尽力释放 */ } }
+    chats.delete(chatKey);
+    const fresh = await createChat(chatKey);
+    fresh.rotated = { reason: decision.reason, detail: decision.detail, from: from || null, to: fresh.sessionId };
+    log(`上下文轮换（${decision.reason}：${decision.detail}→ ${from || "(无)"} 换成 ${fresh.sessionId}）`);
+    return fresh;
+  }
+
+  /** 手动重置：丢掉常驻会话 + 映射，下次消息开新会话。返回被丢弃的 sessionId。 */
+  async function resetChat(chatKey) {
+    const entry = chats.get(chatKey);
+    const dropped = entry?.sessionId ?? chatState[chatKey]?.sessionId ?? null;
+    if (entry) { try { await entry.handle.dispose(); } catch { /* 尽力释放 */ } }
+    chats.delete(chatKey);
+    delete chatState[chatKey];
+    saveChatState(chatState);
+    log(`手动重置会话 ${chatKey}（丢弃 ${dropped || "(无)"}）`);
+    return dropped;
+  }
   /** 一轮问答：追加 user 消息 → 等空闲 → 取最后一条 assistant 文本。 */
   async function ask(chatKey, text, options = {}) {
-    const entry = await ensureChat(chatKey);
+    let entry = await ensureChat(chatKey);
+    // A. 手动重置：/dsh 新 … 或 POST /__dsh-qq/reset 之后的第一条
+    if (options?.fresh) {
+      entry = await rotateChat(chatKey, entry, { reason: 'manual', detail: '用户要求' });
+    } else {
+      // B. 自动轮换：轮数阈值 / 空闲过久
+      const decision = decideRotation({
+        turns: entry.turns,
+        lastUsedAt: entry.lastUsed,
+        maxTurns: Number(cfg.maxTurnsPerSession) || 0,
+        maxIdleHours: Number(cfg.maxSessionIdleHours) || 0
+      });
+      if (decision.rotate) entry = await rotateChat(chatKey, entry, decision);
+    }
     // 权限预设可以在单轮请求里指定（QQ 控制台的 permissionMode 会带过来）：
     // 这样**已经存在的**老会话也能就地升级，不必清掉会话映射、不丢上下文。
     applyPermissionPreset(entry, chatKey, options?.permissionPreset || '', '本轮请求');
@@ -483,8 +531,9 @@ export function apply(ctx, config) {
       });
       const session = entry.agent.session ?? ctx.sessions.get(entry.agent.id);
       const reply = lastAssistantText(session);
-      entry.turns += 1;
-      entry.lastUsed = Date.now();
+            entry.turns += 1;
+            entry.lastUsed = Date.now();
+            rememberSession(chatKey, entry.sessionId, { turns: entry.turns, lastUsedAt: entry.lastUsed });
       if (!reply) {
         const reason = lastTurnReason(session);
         throw new Error(`本轮没有产生 assistant 文本（model=${entry.model ?? '?'}，turn/end=${JSON.stringify(reason)}）`);
@@ -494,6 +543,9 @@ export function apply(ctx, config) {
         sessionId: entry.sessionId,
         elapsedMs: Date.now() - startedAt,
         turns: entry.turns,
+        ...(entry.rotated
+          ? { rotated: { ...entry.rotated, text: cfg.rotateNotice === false ? '' : rotationText(entry.rotated) } }
+          : {}),
         // 诊断：宿主/插件的 console 输出不一定落盘，把关键状态挂到响应里才验得动
         ...(entry.agentPreset ? { agentPreset: entry.agentPreset } : {}),
         ...(entry.presetNote ? { presetNote: entry.presetNote } : {}),
@@ -577,6 +629,7 @@ export function apply(ctx, config) {
         if (!chatKey || !text) return sendJson(res, 400, { ok: false, error: '缺少 chatKey 或 text' });
         try {
           const result = await ask(chatKey, text, {
+                      fresh: body.fresh === true,
             permissionPreset: typeof body.permissionPreset === 'string' ? body.permissionPreset : ''
           });
           log(`← ${chatKey} 一轮完成（${result.elapsedMs}ms，第 ${result.turns} 轮）`);
@@ -605,6 +658,23 @@ export function apply(ctx, config) {
           return sendJson(res, 200, { ok: true, ...result });
         } catch (error) {
           log(`← ${chatKey} 出错：${error?.message ?? error}`);
+          return sendJson(res, 500, { ok: false, error: String(error?.message ?? error) });
+        }
+      });
+
+      // 手动重置某会话的常驻上下文（QQ 侧 /dsh 新 … 走的是同一条逻辑）
+      mount('/__dsh-qq/reset', async (req, res) => {
+        const url = new URL(req.url || '/', 'http://127.0.0.1');
+        if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: '只用 POST' });
+        if (!authorized(req, url)) return sendJson(res, 401, { ok: false, error: 'bridgeToken 不匹配' });
+        let body;
+        try { body = await readJsonBody(req); } catch (error) { return sendJson(res, 400, { ok: false, error: String(error?.message ?? error) }); }
+        const chatKey = String(body.chatKey ?? body.chat ?? '').trim();
+        if (!chatKey) return sendJson(res, 400, { ok: false, error: '缺少 chatKey' });
+        try {
+          const dropped = await resetChat(chatKey);
+          return sendJson(res, 200, { ok: true, chatKey, dropped });
+        } catch (error) {
           return sendJson(res, 500, { ok: false, error: String(error?.message ?? error) });
         }
       });
@@ -644,11 +714,19 @@ export function apply(ctx, config) {
             restrictedPermissionPreset: cfg.restrictedPermissionPreset || '',
             defaultPermissionPreset
           },
+          rotation: {
+            maxTurnsPerSession: Number(cfg.maxTurnsPerSession) || 0,
+            maxSessionIdleHours: Number(cfg.maxSessionIdleHours) || 0,
+            idleDisposeMs: Number(cfg.idleDisposeMs) || 0,
+            note: "达到轮数或空闲阈值会自动换新会话；POST /__dsh-qq/reset 可手动重置"
+          },
           chats: [...chats.entries()].map(([chatKey, e]) => ({
             chatKey,
             sessionId: e.sessionId,
             busy: e.busy,
             turns: e.turns,
+            idleMinutes: e.lastUsed ? Math.round((Date.now() - e.lastUsed) / 60000) : null,
+            rotated: e.rotated ?? null,
             lastUsed: e.lastUsed,
             agentPreset: e.agentPreset ?? null,
             presetNote: e.presetNote ?? null,

@@ -219,3 +219,27 @@ QQ 侧的 `dsh.allowedSenderIds` 是唯一的门，务必只填自己的号。
 - `inject` 里没有 `webServer`：headless 等 profile 没这个服务，写进去整条插件会 pending；路由改走嵌套 `ctx.inject(['webServer'], …)`。
 - 造 user 消息不用 `dsh-llm` 的 `createUserMessage`，直接按它的形状造 `{ id, role:'user', content, source:{kind:'user'} }`。
 - 工具 schema 用标准 JSON Schema：**`required` 必须是对象级数组**，属性级 `required: true` 会被 dsh-tools 的 `assertSupportedJsonSchema` 拒绝。
+
+## 会话轮换（别让一条会话用到天荒地老）
+
+每个 `chatKey` 复用**同一条**常驻会话（`ctx.agents.resume`）；而每轮都要把整条上下文重新发给模型，
+所以轮数一多，**成本近似二次增长**（第 1 轮 2k token，第 20 轮可能 60k+ token/轮）。
+
+两条自动规则（都可关）+ 一条手动通道：
+
+| 配置 | 默认 | 作用 |
+|---|---|---|
+| `maxTurnsPerSession` | `20` | 累计轮数到达就换新会话（0 = 关） |
+| `maxSessionIdleHours` | `12` | 距上次使用超过这么多小时就换新会话（0 = 关） |
+| `rotateNotice` | `true` | 轮换时在回复末尾附一句说明 |
+
+手动重置：
+
+- QQ 侧发 **`/dsh 新 <任务>`** —— 桥会带 `fresh: true`，丢掉常驻会话开新的；
+- 或 `POST /__dsh-qq/reset` `{ "chatKey": "private:123" }`（返回被丢弃的 sessionId）。
+
+轮数与最近使用时间**持久化**在 `~/.dsh-qq-sessions.json`（不只是内存），所以 DSH 重启后计数不归零，
+否则"满 20 轮换新"这条规则永远不会触发。
+
+`GET /__dsh-qq/status` 会返回 `rotation`（当前阈值）与每个会话的 `turns` / `idleMinutes` / `rotated`；
+QQ 侧 `/dsh 状态` 会显示「第 N 轮（自动轮换：满 20 轮 / 空闲 12 小时）」。
