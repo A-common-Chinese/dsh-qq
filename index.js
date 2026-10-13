@@ -478,7 +478,8 @@ export function apply(ctx, config) {
     if (entry) { try { await entry.handle.dispose(); } catch { /* 尽力释放 */ } }
     chats.delete(chatKey);
     const fresh = await createChat(chatKey);
-    fresh.rotated = { reason: decision.reason, detail: decision.detail, from: from || null, to: fresh.sessionId };
+    // rotate: true 是 rotationText() 的判据 —— 漏了它，回给 QQ 的说明就会是空串（实测踩过）
+  fresh.rotated = { rotate: true, reason: decision.reason, detail: decision.detail, from: from || null, to: fresh.sessionId };
     log(`上下文轮换（${decision.reason}：${decision.detail}→ ${from || "(无)"} 换成 ${fresh.sessionId}）`);
     return fresh;
   }
