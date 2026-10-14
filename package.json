@@ -1,6 +1,6 @@
 {
   "name": "dsh-qq",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "QQ <-> DeepSeek Harness bridge: keep one live DSH session per QQ chat and let DSH push messages back into QQ",
   "type": "module",
@@ -10,8 +10,13 @@
   },
   "files": [
     "index.js",
+    "hint.js",
+    "permission-policy.js",
+    "rotation-policy.js",
+    "privacy.js",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "INSTALL.md"
   ],
   "keywords": [
     "deepseek-harness",
