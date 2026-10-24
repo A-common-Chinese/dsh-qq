@@ -5,7 +5,7 @@
  *      而不是只有用户手动发 `/dsh <指令>` 才能触发。
  *
  * 安全默认（全部为"关/最保守"）：
- *   · mode=off            默认不注册可用（技能开了也要把 mode 打开）
+ *   · 开关 = 技能页里的"启用/禁用"（禁用后工具直接从模型列表消失，不用另一层开关）
  *   · scope=whitelist     只在 bot 本来就会回话的会话里可用（非白名单消息不会进模型）
  *   · permissionMode=read-only   默认只读，写操作必须用户显式改设置
  *   · maxPerHour=3        每会话每小时最多 3 次
@@ -15,7 +15,6 @@
  * 本技能是"模型自己判断要不要调"，两条通道并存、互不影响。
  */
 const DEFAULTS = {
-  mode: 'off',
   scope: 'whitelist',
   permissionMode: 'read-only',
   maxPerHour: 3,
@@ -65,9 +64,6 @@ export function setup(api) {
     },
     execute: async (ctx, args) => {
       const cfg = cfgOf();
-      if (String(cfg.mode).toLowerCase() !== 'on') {
-        return { content: '（DSH 远程执行未开启：设置 → 技能 → DSH 远程执行 → 总开关）', isError: true };
-      }
       const scope = String(cfg.scope || 'whitelist');
       if (scope === 'private' && ctx.kind !== 'private') {
         return { content: '（该技能只允许在私聊里使用）', isError: true };
