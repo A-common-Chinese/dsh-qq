@@ -28,7 +28,8 @@ $stage2 = Join-Path $dist '_stage_skill'
 Remove-Item -Recurse -Force $stage2 -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force (Join-Path $stage2 'dsh-agent') | Out-Null
 Copy-Item (Join-Path $skillSrc '*') (Join-Path $stage2 'dsh-agent') -Force
-$zip2 = Join-Path $dist ("dsh-agent-skill-{0}.zip" -f $ver)
+$skillVer = (Get-Content (Join-Path $skillSrc 'skill.json') -Raw -Encoding UTF8 | ConvertFrom-Json).version
+$zip2 = Join-Path $dist ("dsh-agent-skill-{0}.zip" -f $skillVer)
 Remove-Item $zip2 -Force -ErrorAction SilentlyContinue
 Compress-Archive -Path (Join-Path $stage2 'dsh-agent') -DestinationPath $zip2
 Remove-Item -Recurse -Force $stage, $stage2

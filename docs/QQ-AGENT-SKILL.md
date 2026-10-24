@@ -54,3 +54,13 @@
 powershell -File scripts/pack-release.ps1
 # 产出：dist/dsh-qq-plugin-<version>.zip  和  dist/dsh-agent-skill-<version>.zip
 ```
+
+## 兼容性（官方版 / DSH 版）
+
+- 技能系统是**上游原生 API**（`skills/` 目录、`skill.json`、`api.registerTool`、`api.config`，`apiVersion=1`），
+  所以官方 QQ Agent **v0.4 及以上**可以直接用本技能，不需要这个 fork
+- 前置：DSH 侧要装 [dsh-qq](https://github.com/A-common-Chinese/dsh-qq) 插件（提供 `/__dsh-qq/message` 路由）
+- 工具上下文差异已做兜底：
+  - 没有 `ctx.chatKey` 时用 `kind:chatId` 拼（限频/会话复用不会串台）
+  - 没有 `ctx.proactive` 时，`scope=mention` 退化为不限制（想严格就用 `private` 或 `whitelist`）
+- `permissionMode` 只是把权限档位透传给 dsh-qq 插件，真正生效的是插件侧 `permission-policy.js`
