@@ -12,6 +12,23 @@ QQ ↔ DeepSeek Harness 桥的 **DSH 侧**插件：让 QQ 里的对话落到一�
 > - 本插件只是给那台**独立应用**开了一个「**调用本机 DSH**」的入口：QQ 里发 `/dsh <指令>` 时，把**这一条指令**交给 DSH 的常驻会话执行，再把结果送回 QQ；
 > - 桥不生效时（插件没装 / 地址没配）对 QQ Agent 零影响。
 
+---
+
+## Release 的两个资产
+
+本仓库的 Release 会附两个 zip，**分别装在不同侧**：
+
+| 资产 | 装到哪 | 作用 |
+|---|---|---|
+| `dsh-qq-plugin-<version>.zip` | DSH 侧插件目录 | 常驻会话 + `/__dsh-qq/message` 路由（默认能力） |
+| `dsh-agent-skill-<version>.zip` | QQ Agent 的 `skills/dsh-agent/` | 注册 `dsh_task` 工具，让 **QQ 里的模型自己**能调 DSH |
+
+- 只要"手动 `/dsh` 命令"→ 只装插件
+- 想要"机器人自己判断、自己动手"→ 插件 + 技能都要装（技能默认 `mode=off`，需手动打开）
+- 技能说明与安全边界见 [docs/QQ-AGENT-SKILL.md](docs/QQ-AGENT-SKILL.md)
+- 本地打包：`powershell -File scripts/pack-release.ps1`
+
+
 ## 它做什么
 
 | 入口 | 行为 |
