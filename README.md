@@ -21,7 +21,9 @@ QQ ↔ DeepSeek Harness 桥的 **DSH 侧**插件：让 QQ 里的对话落到一�
 | 资产 | 装到哪 | 作用 |
 |---|---|---|
 | `dsh-qq-plugin-<version>.zip` | DSH 侧插件目录 | 常驻会话 + `/__dsh-qq/message` 路由（默认能力） |
-| `dsh-agent-skill-<version>.zip` | QQ Agent 的 `skills/dsh-agent/` | 注册 `dsh_task` 工具，让 **QQ 里的模型自己**能调 DSH |
+| `dsh-agent-skill-<version>.zip` | QQ Agent 的 `resources/app/`（含 `skills/dsh-agent/` 层） | 注册 `dsh_task` 工具，让 **QQ 里的模型自己**能调 DSH |
+
+> 线上技能市场已下线，不再产出"市场版"（zip 根目录直接放技能文件）的包；技能 zip 只有安装版一种。
 
 - 只要"手动 `/dsh` 命令"→ 只装插件
 - 想要"机器人自己判断、自己动手"→ 插件 + 技能都要装（技能默认 `mode=off`，需手动打开）

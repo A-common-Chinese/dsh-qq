@@ -8,17 +8,18 @@
 | 包 | 装在哪 | 作用 |
 |---|---|---|
 | `dsh-qq-plugin-<version>.zip` | **DSH 侧**（`<DSH>/resources/app/plugins/dsh-qq/`） | 提供 `/__dsh-qq/message` 路由：接收 QQ 侧转来的任务，在常驻 DSH 会话里执行并回传结果 |
-| `dsh-agent-skill-<version>.zip` | **QQ Agent 侧**（`<QQAgent>/resources/app/skills/dsh-agent/`） | 注册 `dsh_task` 工具，让 QQ 里的**模型自己**能调 DSH（而不是只有 `/dsh` 命令） |
+| `dsh-agent-skill-<version>.zip` | **QQ Agent 侧**（解压到 `<QQAgent>/resources/app/`，得到 `skills/dsh-agent/`） | 注册 `dsh_task` 工具，让 QQ 里的**模型自己**能调 DSH（而不是只有 `/dsh` 命令） |
 
 两者独立：只装插件 = 你手动发 `/dsh` 才能用；只装技能 = 技能会报"桥不通"。
 **要"机器人自己会干活"，两个都要装。**
 
 ## 安装技能
 
-1. 解压 `dsh-agent-skill-<version>.zip`，把里面的 `dsh-agent/` 整个目录放进：
+1. 解压 `dsh-agent-skill-<version>.zip` 到：
    ```
-   <QQ Agent 安装目录>/resources/app/skills/dsh-agent/
+   <QQ Agent 安装目录>/resources/app/
    ```
+   解压后应得到 `resources/app/skills/dsh-agent/`（zip 内已带 `skills/` 层）
    （热重载默认开启，放进去几秒后自动生效，无需重启）
 2. 控制台「技能」页应出现 **DSH 远程执行 v1.0.0**
 3. 打开 **设置 → 技能 → DSH 远程执行**，按需配置：
