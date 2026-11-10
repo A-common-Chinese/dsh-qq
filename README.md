@@ -34,7 +34,9 @@ QQ ↔ DeepSeek Harness 桥的 **DSH 侧**插件：让 QQ 里的对话落到一�
 | 入口 | 行为 |
 |---|---|
 | `POST /__dsh-qq/message` | body `{ chatKey, text }`。插件按 `chatKey` 找（或建）一个常驻 agent，追加一轮对话，等它跑完，返回 `{ ok, reply, sessionId, elapsedMs, turns }`。**同一个 chatKey 的多轮共享上下文**，不新起进程。 |
-| `GET /__dsh-qq/status` | 列出当前常驻会话（chatKey / sessionId / busy / turns）。 |
+| `GET /__dsh-qq/status` | 列出当前常驻会话（chatKey / sessionId / busy / turns / bound）。 |
+| `GET /__dsh-qq/sessions` | 列出 DSH 的**未归档会话**（id / 标题 / 工作目录 / 最近提问时间），供 QQ 侧 `/dsh get_dsh_id` 使用。 |
+| `POST /__dsh-qq/use` | body `{ chatKey, sessionId }`：把该 QQ 会话绑定到指定的已有 DSH 会话（之后续在这条会话上，且不再自动轮换）。 |
 | 工具 `qq_send` | 任意 DSH 会话都能调用：`{ chat: "private:<QQ号>" \| "group:<群号>", text }` → 调 QQ Agent 的 `POST /api/inbound` 发出去。 |
 | 工具 `qq_send_file` | 同上，但发**文件**：`{ chat, path, name? }` → QQ Agent 的 `POST /api/inbound-file` → OneBot `upload_group_file` / `upload_private_file`。`path` 必须是本机（跑 QQ Agent 那台）上存在的绝对路径，受 `dsh.maxFileBytes` 与 `dsh.fileRoots` 约束。 |
 
@@ -127,6 +129,16 @@ POST /__dsh-qq/message  { chatKey, text: "把这条消息的原文一字不改�
 
 
 ## 常驻会话的「工具面」与「权限」（`agentPreset` / `permissionPreset`）
+
+### 接入已有 DSH 会话（0.2.1）
+
+QQ 里：
+
+- `/dsh get_dsh_id`（别名 `/dsh list`、`/dsh id`）→ 列出未归档 DSH 会话：`序号. 名称（时间）`；
+  自动排除 AI 子代理会话（subagent 行带 identity 的那些）
+- `/dsh use <序号|名称|id>` → 把当前 QQ 会话绑定到该 DSH 会话；之后 `/dsh` 都续在这条会话上
+- 绑定后**不会自动轮换**（`maxTurnsPerSession` 对它失效），要恢复自动轮换先 `/dsh 新` 或 `/dsh use` 到别的会话
+- 如果该会话正开在 DSH GUI 里（有活动写句柄），插件会进入 **attach 模式**：不 resume、不抢写句柄，直接把 QQ 消息追加到那个已打开的会话；此时消息会同时出现在 DSH 界面里
 
 `/dsh` 的常驻会话是**程序化创建**的 agent，它的能力由两件事决定，而且**都不吃 DSH 的全局默认**。
 本机实测（2026-10-11）：用户问"让机器人帮我关机"，常驻会话回的是

@@ -16,7 +16,7 @@
 //     { id: uuid, role: 'user', content: [...], source: { kind: 'user' } }。
 
 import { randomUUID } from 'node:crypto';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createPrivacyFilter } from './privacy.js';
@@ -45,6 +45,49 @@ function saveChatState(state) {
   } catch (error) {
     console.log('[dsh-qq] 会话映射写入失败：' + (error?.message ?? error));
   }
+}
+
+// ── DSH 会话索引（/dsh get_dsh_id、/dsh use <id> 用）────────────────────
+// DSH 把会话元数据缓存在 <DSH_HOME>/storages/session_projcache/sessions/*.json，
+// 归档列表在 <DSH_HOME>/storages/workspace.json 的 global.archivedSessionIds。
+// 不在归档列表里的就是"未归档会话"。
+const DSH_HOME = process.env.DSH_HOME || join(homedir(), '.dsh');
+const DSH_PROJCACHE_DIR = join(DSH_HOME, 'storages', 'session_projcache', 'sessions');
+const DSH_WORKSPACE_FILE = join(DSH_HOME, 'storages', 'workspace.json');
+
+function loadArchivedIds() {
+  try {
+    const j = JSON.parse(readFileSync(DSH_WORKSPACE_FILE, 'utf8'));
+    const ids = j?.global?.archivedSessionIds;
+    return new Set(Array.isArray(ids) ? ids.map(String) : []);
+  } catch { return new Set(); }
+}
+
+/** 列未归档会话：id / 标题 / 工作目录 / 最近一次提问时间。 */
+export function listDshSessions(limit = 20) {
+  const archived = loadArchivedIds();
+  const out = [];
+  let names = [];
+  try { names = readdirSync(DSH_PROJCACHE_DIR).filter((f) => f.endsWith('.json')); } catch { return out; }
+  for (const f of names) {
+    const id = f.slice(0, -5);
+    if (archived.has(id)) continue;
+    let rec;
+    try { rec = JSON.parse(readFileSync(join(DSH_PROJCACHE_DIR, f), 'utf8')); } catch { continue; }
+    const rows = rec?.record?.rows || {};
+    const identity = rec?.record?.identity || {};
+    // 排除 AI 子代理会话：子代理的 subagent 行里带 identity（label/mode），普通会话是空对象
+    const sub = rows.subagent?.val;
+    if (sub && typeof sub === 'object' && (sub.identity || Object.keys(sub).length > 0)) continue;
+    const title = String(rows.title?.val || '').replace(/\s+/g, ' ').trim();
+    const listMeta = rows.sessionListMetadata?.val || {};
+    if (listMeta.blank === true) continue;
+    const cwd = String(identity.cwd || rows.workingDirectory?.val || '');
+    const at = Number(listMeta.lastPromptAt) || Number(identity.createdAt) || 0;
+    out.push({ id, title: title || '(无标题)', cwd, at, turns: Number(rows.sessionStats?.val?.turns) || 0 });
+  }
+  out.sort((a, b) => b.at - a.at);
+  return out.slice(0, Math.max(1, Math.min(50, Number(limit) || 20)));
 }
 
 /** 与 cordis.patch.yml 里的默认值保持一致（补丁只给用户可改的那份）。 */
@@ -405,6 +448,21 @@ export function apply(ctx, config) {
     }
   }
 
+  /** 释放常驻会话：attach 到 GUI 已打开会话时没有 handle，不能 dispose 它。 */
+  async function disposeEntry(entry) {
+    if (!entry) return;
+    if (entry.attached === true || !entry.handle) return;
+    try { await entry.handle.dispose(); } catch { /* 尽力释放 */ }
+  }
+
+  /** 若该会话正被 DSH GUI 打开（活动 agent），直接复用，避免 resume 的写句柄冲突。 */
+  function findLiveAgent(sessionId) {
+    try {
+      const agent = typeof ctx.agents?.get === 'function' ? ctx.agents.get(sessionId) : null;
+      return agent || null;
+    } catch { return null; }
+  }
+
   async function createChat(chatKey) {
     const safe = String(chatKey).replace(/[^A-Za-z0-9_-]+/g, '_').slice(0, 48);
     const sessionId = `qq-${safe}-${randomUUID().slice(0, 8)}`;
@@ -434,6 +492,24 @@ export function apply(ctx, config) {
     if (existing) return existing;
     const saved = chatState[chatKey]?.sessionId;
     if (saved) {
+      // 该会话可能正开在 DSH GUI 里：拿不到写句柄（resume 会报 already owned），
+      // 直接复用活动 agent，把 QQ 消息追加到同一条会话。
+      const live = findLiveAgent(saved);
+      if (live) {
+        const entry = {
+          handle: null,
+          agent: live,
+          attached: true,
+          busy: false,
+          lastUsed: Number(chatState[chatKey]?.lastUsedAt) || Date.now(),
+          turns: Number(chatState[chatKey]?.turns) || 0,
+          sessionId: saved,
+          model: 'attached'
+        };
+        chats.set(chatKey, entry);
+        log(`复用 DSH 中已打开的会话 ${chatKey} → ${saved}（attach 模式）`);
+        return entry;
+      }
       try {
         const agentOptions = resolveAgentOptions();
         const handle = await ctx.agents.resume({
@@ -458,7 +534,7 @@ export function apply(ctx, config) {
         if (String(entry.presetNote || '').startsWith('全部失败')
           && String(cfg.onPresetFailure || 'warn') === 'recreate') {
           log(`⚠️ 老会话挂不上预设（${entry.presetNote}），按 onPresetFailure=recreate 弃用并新建`);
-          try { await entry.handle.dispose(); } catch { /* 尽力释放 */ }
+          await disposeEntry(entry);
           chats.delete(chatKey);
           delete chatState[chatKey];
           saveChatState(chatState);
@@ -466,6 +542,9 @@ export function apply(ctx, config) {
         }
         return entry;
       } catch (error) {
+        if (chatState[chatKey]?.bound === true) {
+          throw new Error(`已绑定的会话 ${saved} 恢复失败：${error?.message ?? error}`);
+        }
         log(`恢复会话 ${saved} 失败（${error?.message ?? error}），改建新会话`);
       }
     }
@@ -475,7 +554,7 @@ export function apply(ctx, config) {
   /** 丢掉当前常驻会话并新建一条（轮换用）。 */
   async function rotateChat(chatKey, entry, decision) {
     const from = entry?.sessionId ?? "";
-    if (entry) { try { await entry.handle.dispose(); } catch { /* 尽力释放 */ } }
+    await disposeEntry(entry);
     chats.delete(chatKey);
     const fresh = await createChat(chatKey);
     // rotate: true 是 rotationText() 的判据 —— 漏了它，回给 QQ 的说明就会是空串（实测踩过）
@@ -488,7 +567,7 @@ export function apply(ctx, config) {
   async function resetChat(chatKey) {
     const entry = chats.get(chatKey);
     const dropped = entry?.sessionId ?? chatState[chatKey]?.sessionId ?? null;
-    if (entry) { try { await entry.handle.dispose(); } catch { /* 尽力释放 */ } }
+    await disposeEntry(entry);
     chats.delete(chatKey);
     delete chatState[chatKey];
     saveChatState(chatState);
@@ -502,8 +581,8 @@ export function apply(ctx, config) {
     if (options?.fresh) {
       entry = await rotateChat(chatKey, entry, { reason: 'manual', detail: '用户要求' });
     } else {
-      // B. 自动轮换：轮数阈值 / 空闲过久
-      const decision = decideRotation({
+      // B. 自动轮换：轮数阈值 / 空闲过久（手动绑定的会话不轮换，否则绑了也会被换掉）
+      const decision = chatState[chatKey]?.bound === true ? { rotate: false } : decideRotation({
         turns: entry.turns,
         lastUsedAt: entry.lastUsed,
         maxTurns: Number(cfg.maxTurnsPerSession) || 0,
@@ -680,6 +759,46 @@ export function apply(ctx, config) {
         }
       });
 
+      // 未归档会话列表（QQ 侧 /dsh get_dsh_id 用）
+      mount('/__dsh-qq/sessions', async (req, res) => {
+        const url = new URL(req.url || '/', 'http://127.0.0.1');
+        if (req.method !== 'GET') return sendJson(res, 405, { ok: false, error: '只用 GET' });
+        if (!authorized(req, url)) return sendJson(res, 401, { ok: false, error: 'bridgeToken 不匹配' });
+        try {
+          const limit = Math.max(1, Math.min(50, Number(url.searchParams.get('limit')) || 20));
+          return sendJson(res, 200, { ok: true, sessions: listDshSessions(limit) });
+        } catch (error) {
+          return sendJson(res, 500, { ok: false, error: String(error?.message ?? error) });
+        }
+      });
+
+      // 绑定/切换某 QQ 会话到指定 DSH 会话（QQ 侧 /dsh use <id> 用）
+      mount('/__dsh-qq/use', async (req, res) => {
+        const url = new URL(req.url || '/', 'http://127.0.0.1');
+        if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: '只用 POST' });
+        if (!authorized(req, url)) return sendJson(res, 401, { ok: false, error: 'bridgeToken 不匹配' });
+        let body;
+        try { body = await readJsonBody(req); } catch (error) { return sendJson(res, 400, { ok: false, error: String(error?.message ?? error) }); }
+        const chatKey = String(body.chatKey ?? body.chat ?? '').trim();
+        const sessionId = String(body.sessionId ?? '').trim();
+        if (!chatKey || !sessionId) return sendJson(res, 400, { ok: false, error: '缺少 chatKey 或 sessionId' });
+        const hit = listDshSessions(50).find((x) => x.id === sessionId);
+        if (!hit) return sendJson(res, 404, { ok: false, error: '会话不存在或已归档' });
+        const cur = chats.get(chatKey);
+        if (cur) { await disposeEntry(cur); chats.delete(chatKey); }
+        chatState[chatKey] = {
+          sessionId,
+          bound: true,
+          title: hit.title,
+          turns: 0,
+          lastUsedAt: Date.now(),
+          updatedAt: Date.now()
+        };
+        saveChatState(chatState);
+        log(`绑定会话 ${chatKey} → ${sessionId}（${hit.title}）`);
+        return sendJson(res, 200, { ok: true, chatKey, sessionId, title: hit.title, cwd: hit.cwd });
+      });
+
       mount(String(cfg.statusPath), async (req, res) => {
         const url = new URL(req.url || '/', 'http://127.0.0.1');
         if (!authorized(req, url)) return sendJson(res, 401, { ok: false, error: 'bridgeToken 不匹配' });
@@ -728,6 +847,9 @@ export function apply(ctx, config) {
             turns: e.turns,
             idleMinutes: e.lastUsed ? Math.round((Date.now() - e.lastUsed) / 60000) : null,
             rotated: e.rotated ?? null,
+            bound: chatState[chatKey]?.bound === true,
+            attached: e.attached === true,
+            title: chatState[chatKey]?.title ?? null,
             lastUsed: e.lastUsed,
             agentPreset: e.agentPreset ?? null,
             presetNote: e.presetNote ?? null,
@@ -736,7 +858,7 @@ export function apply(ctx, config) {
         });
       });
 
-      log(`路由已挂载：POST ${cfg.routePath}，GET ${cfg.statusPath}`);
+      log(`路由已挂载：POST ${cfg.routePath}，GET ${cfg.statusPath}，GET /__dsh-qq/sessions，POST /__dsh-qq/use`);
     });
   } else {
     log('ctx.inject 不可用，跳过路由挂载');
