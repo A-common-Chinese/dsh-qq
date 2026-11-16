@@ -24,6 +24,15 @@ import { withBridgeHint } from './hint.js';
 import { pickPermissionPreset } from './permission-policy.js';
 import { decideRotation, rotationText } from './rotation-policy.js';
 
+/** 从自身 package.json 读版本号：/status 里回传，重启后一眼能确认加载的是哪版。 */
+const PKG_VERSION = (() => {
+  try {
+    return JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version || '';
+  } catch {
+    return '';
+  }
+})();
+
 /**
  * chatKey → sessionId 的持久映射。有了它，DSH 重启/插件重载后同一个 QQ 会话还能
  * 用 ctx.agents.resume() 接上原来的上下文，而不是另起一条会话。
@@ -833,6 +842,7 @@ export function apply(ctx, config) {
         } catch { /* 诊断失败不影响状态返回 */ }
         sendJson(res, 200, {
           ok: true,
+          version: PKG_VERSION,
           cwd: cfg.cwd || process.cwd(),
           privacy: privacy.describe(),
           presets: {
@@ -868,7 +878,7 @@ export function apply(ctx, config) {
         });
       });
 
-      log(`路由已挂载：POST ${cfg.routePath}，GET ${cfg.statusPath}，GET /__dsh-qq/sessions，POST /__dsh-qq/use`);
+      log(`路由已挂载（dsh-qq v${PKG_VERSION}）：POST ${cfg.routePath}，GET ${cfg.statusPath}，GET /__dsh-qq/sessions，POST /__dsh-qq/use`);
     });
   } else {
     log('ctx.inject 不可用，跳过路由挂载');

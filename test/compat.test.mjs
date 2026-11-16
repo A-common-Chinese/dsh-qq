@@ -30,6 +30,7 @@ check('schemastery 先试 @deepseek-ai/schemastery', src.includes("@deepseek-ai/
 check('诊断改用 deriveMessages', src.includes('deriveMessages'));
 check('注入 agents/sessions/tools/agentDefaultModel', /export const inject = \[[^\]]*'agents'[^\]]*'sessions'[^\]]*'tools'[^\]]*'agentDefaultModel'/.test(src));
 check('仍导出 apply', /export function apply\(/.test(src));
+check('/status 回传插件版本', src.includes('version: PKG_VERSION'));
 
 console.log(`\n通过 ${pass}，失败 ${fail}`);
 process.exit(fail ? 1 : 0);
