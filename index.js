@@ -169,11 +169,15 @@ const DEFAULTS = {
   }
 };
 
+// DSH 0.2.2 起 schemastery 由 @deepseek-ai/schemastery 提供；profile 里通常解析不到
+// 内置包，所以两者都试一次，失败时 Config 留空（宿主不校验、不给表单，config 原样传入）。
 let Schema = null;
-try {
-  Schema = (await import('schemastery')).default;
-} catch {
-  // 没有 schemastery 也能跑：Config 缺省时宿主不校验、GUI 不给表单，但补丁里的 config 照样传进来
+for (const spec of ['@deepseek-ai/schemastery', 'schemastery']) {
+  try {
+    const mod = await import(spec);
+    Schema = mod.default ?? mod;
+    break;
+  } catch { /* 试下一个候选 */ }
 }
 
 export const name = 'dsh-qq';
@@ -316,16 +320,22 @@ export function apply(ctx, config) {
   const chats = new Map();
   const log = (msg) => console.log(`[dsh-qq] ${msg}`);
 
-  /** 本轮没有 assistant 文本时，把 turn/end 的原因挖出来，方便 QQ 侧看到真因。 */
-  function lastTurnReason(session) {
+  /**
+   * 本轮没有 assistant 文本时的诊断。
+   * DSH 0.2.2 起 session.snapshotEvents()/eventAt() 已废弃（只保留给旧代码），
+   * 这里改用公开的 deriveMessages() + agent.status，不再读已废弃的日志接口。
+   */
+  function lastTurnReason(session, agent) {
+    const parts = [];
     try {
-      const seq = Number(session?.seq) || 0;
-      const events = session.snapshotEvents(Math.max(0, seq - 20));
-      for (let i = events.length - 1; i >= 0; i -= 1) {
-        if (events[i]?.type === 'turn/end') return events[i].data?.reason ?? null;
-      }
-    } catch { /* 诊断失败不影响主流程 */ }
-    return null;
+      if (agent?.status) parts.push(`agent.status=${agent.status}`);
+    } catch { /* ignore */ }
+    try {
+      const messages = session?.deriveMessages?.() || [];
+      const hasAssistant = messages.some((m) => m?.role === 'assistant');
+      parts.push(hasAssistant ? '有 assistant 消息但文本为空' : '没有 assistant 消息');
+    } catch { /* ignore */ }
+    return parts.length ? parts.join('，') : null;
   }
 
   /** 新 agent 的模型路由：显式配置优先，其次问 DSH 的默认模型服务。 */
@@ -615,8 +625,8 @@ export function apply(ctx, config) {
             entry.lastUsed = Date.now();
             rememberSession(chatKey, entry.sessionId, { turns: entry.turns, lastUsedAt: entry.lastUsed });
       if (!reply) {
-        const reason = lastTurnReason(session);
-        throw new Error(`本轮没有产生 assistant 文本（model=${entry.model ?? '?'}，turn/end=${JSON.stringify(reason)}）`);
+        const reason = lastTurnReason(session, entry.agent);
+        throw new Error(`本轮没有产生 assistant 文本（model=${entry.model ?? '?'}，诊断=${JSON.stringify(reason)}）`);
       }
       return {
         reply,

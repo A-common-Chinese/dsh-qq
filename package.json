@@ -1,8 +1,8 @@
 {
   "name": "dsh-qq",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "private": true,
-  "description": "QQ <-> DeepSeek Harness bridge: keep one live DSH session per QQ chat and let DSH push messages back into QQ",
+  "description": "QQ <-> DeepSeek Harness bridge for DSH 0.2.2+: keep one live DSH session per QQ chat and let DSH push messages back into QQ",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -30,16 +30,9 @@
       "patch": "./cordis.patch.yml"
     }
   },
-  "peerDependencies": {
-    "schemastery": ">=3"
-  },
-  "peerDependenciesMeta": {
-    "schemastery": {
-      "optional": true
-    }
-  },
   "engines": {
-    "node": ">=20"
+    "node": ">=24.9",
+    "dsh": ">=0.2.2-rc.3"
   },
   "license": "MIT"
 }

@@ -14,6 +14,27 @@ QQ ↔ DeepSeek Harness 桥的 **DSH 侧**插件：让 QQ 里的对话落到一�
 
 ---
 
+## 兼容性
+
+| 项目 | 要求 |
+|---|---|
+| DSH | **0.2.2-rc.3 及以上**（本版按该版本 API 适配；0.2.1 及更早未验证） |
+| Node | **24.9+**（DSH 0.2.2 的运行时要求） |
+| QQ Agent | 0.8.0+（`dsh.transport=plugin`，走本插件的 `/__dsh-qq/message`） |
+
+适配说明（v0.3.0）：
+
+- 不再调用已废弃的 `session.snapshotEvents()`（DSH 0.2.2 起仅保留给旧代码）；
+  无 assistant 文本时改用公开的 `deriveMessages()` + `agent.status` 做诊断
+- `schemastery` 先尝试 `@deepseek-ai/schemastery`，再退回裸名；profile 解析不到内置包时
+  `Config` 留空（宿主不校验、不给表单，配置照常原样传入）
+- `package.json` 增加 `engines.dsh` / `engines.node` 声明
+- `ctx.agents.create/resume`、`Agent.session`、`handle.dispose()` 等用法在 0.2.2-rc.3 下复核通过
+
+> 改 `index.js` 后必须**重启 DSH**（宿主缓存 ESM 模块）；只改配置不需要重启。
+
+---
+
 ## Release 的两个资产
 
 本仓库的 Release 会附两个 zip，**分别装在不同侧**：
